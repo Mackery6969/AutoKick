@@ -380,6 +380,7 @@ const LIST_EXPLAINERS = {
 };
 
 async function editList({ api, opts, interaction, userId }, listName, action) {
+  if (listName !== 'whitelist' && listName !== 'blacklist') return { content: 'Unknown command.' };
   const cfg = api.getConfig();
   if (action === 'list') {
     const title = listName === 'whitelist' ? 'Whitelist (never kicked)' : 'Blacklist (kickable even with a whitelisted role)';
