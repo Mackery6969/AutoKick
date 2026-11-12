@@ -10,6 +10,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import { assess, DAY_MS, escapeMarkdown, formatDuration } from './policy.js';
 import {
+  APP_FLAGS_MEMBERS_INTENT,
   Budget,
   BudgetExceeded,
   canKick,
@@ -37,13 +38,18 @@ const REQUEST_BUDGET = 44; // leaves headroom under the free plan's 50
 const DEFAULT_GATEWAY = 'wss://gateway.discord.gg';
 const COUNTED_MESSAGE_TYPES = new Set([0, 18, 19]); // normal message, thread created, reply
 
+const TOKEN_PROBLEM = 'Discord rejected the bot token. Set the DISCORD_TOKEN secret again.';
+const INTENT_PROBLEM =
+  'Discord says "Server Members Intent" is off. Turn it on under Bot > Privileged Gateway Intents ' +
+  'in the Discord Developer Portal and click "Save Changes". The bot checks again every minute.';
+
 const FATAL_CLOSE_CODES = {
-  4004: 'Discord rejected the bot token. Set the DISCORD_TOKEN secret again.',
+  4004: TOKEN_PROBLEM,
   4010: 'Discord says the shard is invalid.',
   4011: 'The bot is in too many servers to run without sharding.',
   4012: 'Discord says the gateway version is invalid.',
   4013: 'Discord says the intents are invalid.',
-  4014: 'Turn on "Server Members Intent" under Bot → Privileged Gateway Intents in the Discord Developer Portal.',
+  4014: INTENT_PROBLEM,
 };
 const NO_RESUME_CLOSE_CODES = new Set([4007, 4009]);
 
@@ -213,8 +219,17 @@ export class AutoKickBot extends DurableObject {
     if (!token || Date.now() < this.nextConnectAt) return;
     this.tokenId = await tokenFingerprint(token);
     const fatal = this.getState('fatal');
-    // After a fatal error, wait before retrying, unless the token has been changed since.
-    if (fatal && fatal.token === this.tokenId && Date.now() - fatal.at < FATAL_RETRY_MS) return;
+    if (fatal && fatal.token === this.tokenId) {
+      // Ask Discord whether the problem is fixed. Unlike a gateway login, this
+      // doesn't count toward the daily login limit, so it can run every minute.
+      const problem = await this.applicationProblem(budget);
+      if (problem) {
+        this.setState('fatal', { ...fatal, message: problem, checkedAt: Date.now() });
+        return;
+      }
+      const fixable = fatal.code === undefined || fatal.code === 4004 || fatal.code === 4014;
+      if (!fixable && Date.now() - fatal.at < FATAL_RETRY_MS) return;
+    }
 
     const session = this.getState('session');
     if (!session && !this.identifyAllowed()) return;
@@ -233,6 +248,17 @@ export class AutoKickBot extends DurableObject {
     ws.addEventListener('error', () =>
       this.safely(() => this.dropConnection(ws, 'socket error', { resumable: true })),
     );
+  }
+
+  /** Returns why the bot can't log in (bad token, intent off), or null if Discord says it's fine. */
+  async applicationProblem(budget) {
+    try {
+      const app = await this.rest('GET', '/applications/@me', { budget });
+      return app.flags & APP_FLAGS_MEMBERS_INTENT ? null : INTENT_PROBLEM;
+    } catch (err) {
+      if (err.status === 401) return TOKEN_PROBLEM;
+      throw err;
+    }
   }
 
   safely(fn) {
@@ -324,13 +350,13 @@ export class AutoKickBot extends DurableObject {
     const fatal = FATAL_CLOSE_CODES[code];
     if (fatal) {
       console.error(`Gateway closed with ${code}: ${fatal}`);
-      this.dropConnection(ws, `closed (${code})`, { resumable: false, fatalMessage: fatal });
+      this.dropConnection(ws, `closed (${code})`, { resumable: false, fatalMessage: fatal, fatalCode: code });
       return;
     }
     this.dropConnection(ws, `closed by Discord (${code} ${reason})`, { resumable: !NO_RESUME_CLOSE_CODES.has(code) });
   }
 
-  dropConnection(ws, reason, { resumable, fatalMessage } = {}) {
+  dropConnection(ws, reason, { resumable, fatalMessage, fatalCode } = {}) {
     if (ws !== this.ws) return;
     this.stopHeartbeat();
     this.ws = null;
@@ -339,7 +365,9 @@ export class AutoKickBot extends DurableObject {
     const session = this.getState('session');
     if (resumable && session && this.seq != null) this.setState('session', { ...session, seq: this.seq });
     else this.setState('session', null);
-    if (fatalMessage) this.setState('fatal', { at: Date.now(), message: fatalMessage, token: this.tokenId });
+    if (fatalMessage) {
+      this.setState('fatal', { at: Date.now(), checkedAt: Date.now(), code: fatalCode, message: fatalMessage, token: this.tokenId });
+    }
 
     try {
       // 4000 keeps the session resumable; 1000 tells Discord we're done with it.
@@ -670,7 +698,8 @@ export class AutoKickBot extends DurableObject {
 
   async status() {
     await this.ensureAlarm();
-    let problem = this.getState('fatal')?.message ?? null;
+    const fatal = this.getState('fatal');
+    let problem = fatal?.message ?? null;
     if (!this.env.DISCORD_TOKEN) problem = 'The DISCORD_TOKEN secret is not set.';
     else if (!this.env.DISCORD_PUBLIC_KEY) problem = "The DISCORD_PUBLIC_KEY secret is not set, so slash commands won't work.";
     else if (!this.ready && !this.identifyAllowed()) problem = 'Too many Discord logins today; paused until tomorrow (UTC).';
@@ -679,6 +708,7 @@ export class AutoKickBot extends DurableObject {
       connected: this.ready,
       servers: this.sql.exec('SELECT COUNT(*) AS n FROM guilds').toArray()[0].n,
       problem,
+      lastChecked: problem && fatal?.checkedAt ? new Date(fatal.checkedAt).toISOString() : undefined,
     };
   }
 

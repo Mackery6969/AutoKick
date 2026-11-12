@@ -7,6 +7,10 @@ export const API = 'https://discord.com/api/v10';
 // Message *content* is not needed; MESSAGE_CREATE still says who sent the message.
 export const INTENTS = (1 << 0) | (1 << 1) | (1 << 7) | (1 << 9);
 
+// Application flags that mean the Server Members Intent toggle is on
+// (GATEWAY_GUILD_MEMBERS for verified bots, _LIMITED for bots in under 100 servers).
+export const APP_FLAGS_MEMBERS_INTENT = (1 << 14) | (1 << 15);
+
 export const PERM_KICK_MEMBERS = 1n << 1n;
 export const PERM_ADMINISTRATOR = 1n << 3n;
 

@@ -47,7 +47,9 @@ export default {
       return handleInteraction(request, env, ctx);
     }
     if (request.method === 'GET' && url.pathname === '/') {
-      return Response.json(await getBot(env).status());
+      return Response.json(await getBot(env).status(), {
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      });
     }
     return new Response('Not found', { status: 404 });
   },

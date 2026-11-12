@@ -4,6 +4,9 @@
   "main": "src/index.js",
   "compatibility_date": "2026-11-01",
 
+  // Public address of the bot (status page at /, Discord interactions at /interactions).
+  "routes": [{ "pattern": "autokick.mackery.com", "custom_domain": true }],
+
   // One Durable Object instance holds the Discord connection and all data.
   "durable_objects": {
     "bindings": [{ "name": "AUTOKICK", "class_name": "AutoKickBot" }]

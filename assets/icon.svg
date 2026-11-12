@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FF8A2A"/>
+      <stop offset="1" stop-color="#F0600F"/>
+    </linearGradient>
+    <mask id="seams">
+      <rect x="-100" y="-100" width="900" height="800" fill="#fff"/>
+      <rect x="20" y="66" width="280" height="22" fill="#000"/>
+      <g fill="none" stroke="#000" stroke-width="18" stroke-linecap="round">
+        <path d="M185 145 H275"/>
+        <path d="M185 200 H275"/>
+        <path d="M195 255 H285"/>
+        <path d="M468 350 C452 398 456 446 478 482"/>
+      </g>
+    </mask>
+  </defs>
+
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+
+  <!-- motion lines -->
+  <g stroke="#fff" stroke-width="34" stroke-linecap="round" opacity="0.9">
+    <path d="M178 548 H292"/>
+    <path d="M146 628 H286"/>
+    <path d="M196 708 H300"/>
+  </g>
+
+  <g fill="#fff" transform="translate(560 500) rotate(-16) scale(0.8) translate(-315 -300)">
+    <path mask="url(#seams)" d="M44 0 H276 Q300 0 300 24 V250 C300 300 340 330 420 345 L500 360 C570 372 610 410 610 460 V480 H0 V330 C0 300 20 285 20 260 V24 Q20 0 44 0 Z"/>
+    <path d="M0 502 H610 Q640 502 640 527 Q640 552 610 552 H190 L181 590 Q178 600 168 600 H0 Q-10 600 -10 590 V512 Q-10 502 0 502 Z"/>
+  </g>
+</svg>
