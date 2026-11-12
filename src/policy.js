@@ -110,25 +110,34 @@ export function assess(member, cfg, { now, downtime }) {
   const inactiveMs = observedInactiveMs(lastActive, now, [...downtime, ...(member.pauses ?? [])]);
   const pausedMs = observedInactiveMs(lastActive, now, downtime) - inactiveMs;
   const thresholdMs = cfg.days * DAY_MS;
-  const base = { lastActive, inactiveMs, pausedMs, thresholdMs, recorded: member.id in cfg.activity };
+  const base = {
+    lastActive,
+    inactiveMs,
+    pausedMs,
+    thresholdMs,
+    recorded: member.id in cfg.activity,
+    kickable: Boolean(member.kickable),
+  };
 
   if (member.bot) return { ...base, action: 'skip', reason: 'bot' };
   if (member.isOwner) return { ...base, action: 'skip', reason: 'server owner' };
 
   const list = listVerdict(cfg, member.id, member.roleIds);
+  // Which list entry (if any) decided this member's protection, for display.
+  const listed = { ...base, listed: list.reason ? { reason: list.reason, roleId: list.roleId ?? null } : null };
   if (list.protected) {
-    return { ...base, action: 'protected', reason: list.reason, roleId: list.roleId };
+    return { ...listed, action: 'protected', reason: list.reason, roleId: list.roleId };
   }
   if (member.pausedBy) {
-    return { ...base, action: 'paused', reason: member.pausedBy, remainingMs: Math.max(0, thresholdMs - inactiveMs) };
+    return { ...listed, action: 'paused', reason: member.pausedBy, remainingMs: Math.max(0, thresholdMs - inactiveMs) };
   }
   if (inactiveMs < thresholdMs) {
-    return { ...base, action: 'keep', reason: 'active', remainingMs: thresholdMs - inactiveMs };
+    return { ...listed, action: 'keep', reason: 'active', remainingMs: thresholdMs - inactiveMs };
   }
   if (!member.kickable) {
-    return { ...base, action: 'blocked', reason: 'role is above the bot or bot lacks Kick Members' };
+    return { ...listed, action: 'blocked', reason: 'role is above the bot or bot lacks Kick Members' };
   }
-  return { ...base, action: 'kick', reason: list.reason ?? 'inactive' };
+  return { ...listed, action: 'kick', reason: list.reason ?? 'inactive' };
 }
 
 /**

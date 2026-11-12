@@ -19,6 +19,7 @@ import {
 } from './policy.js';
 import {
   APP_FLAGS_MEMBERS_INTENT,
+  botHasKickPermission,
   Budget,
   BudgetExceeded,
   canKick,
@@ -52,8 +53,8 @@ const COUNTED_MESSAGE_TYPES = new Set([0, 18, 19]); // normal message, thread cr
 // Channels where people can be active: text, voice, announcement, stage, forum, media.
 const ACTIVITY_CHANNEL_TYPES = new Set([0, 2, 5, 13, 15, 16]);
 
-// Shown under the bot's name in Discord: "Watching Activity..." (activity type 3 = Watching).
-const PRESENCE = { since: null, activities: [{ name: 'Activity...', type: 3 }], status: 'online', afk: false };
+// Shown under the bot's name in Discord as "Playing Watching Activity..." (activity type 0 = Playing).
+const PRESENCE = { since: null, activities: [{ name: 'Watching Activity...', type: 0 }], status: 'online', afk: false };
 
 const TOKEN_PROBLEM = 'Discord rejected the bot token. Set the DISCORD_TOKEN secret again.';
 const INTENT_PROBLEM =
@@ -772,7 +773,14 @@ export class AutoKickBot extends DurableObject {
       member,
       result: this.assessWith(full, meta, botMember, member, pauses.get(member.id) ?? [], ctx),
     }));
-    return { cfg, meta, botMember, results, detectedPauseRoles: detectedPauseRoleIds(meta) };
+    return {
+      cfg,
+      meta,
+      botMember,
+      results,
+      detectedPauseRoles: detectedPauseRoleIds(meta),
+      botCanKick: botHasKickPermission(meta, botMember),
+    };
   }
 
   async assessMember(guildId, userId, budget) {

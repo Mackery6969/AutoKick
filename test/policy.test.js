@@ -117,6 +117,15 @@ test('a member who is muted right now is never kicked and their clock is frozen'
   assert.equal(result.remainingMs, 20 * DAY_MS);
 });
 
+test('assess reports which list entry applies and whether the member is kickable', () => {
+  const c = cfg({ blacklist: { roles: ['trial'], users: [] }, activity: { m: DAY_MS } });
+  const result = assess(plain({ roleIds: ['trial'], kickable: false }), c, { now: 2 * DAY_MS, downtime: [] });
+  assert.equal(result.action, 'keep');
+  assert.deepEqual(result.listed, { reason: 'blacklisted role', roleId: 'trial' });
+  assert.equal(result.kickable, false);
+  assert.equal(assess(plain({}), cfg(), { now: DAY_MS, downtime: [] }).listed, null);
+});
+
 test('a whitelisted member stays protected even while muted', () => {
   const c = cfg({ whitelist: { roles: [], users: ['m'] } });
   assert.equal(assess(plain({ pausedBy: 'timeout' }), c, { now: DAY_MS, downtime: [] }).action, 'protected');

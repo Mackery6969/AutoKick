@@ -15,7 +15,7 @@ const baseConfig = () => ({
   channels: { whitelist: [], blacklist: [] },
 });
 
-function fakeApi({ cfg = baseConfig(), results = [], logFails = false, detected = [], hidden = [] } = {}) {
+function fakeApi({ cfg = baseConfig(), results = [], logFails = false, detected = [], hidden = [], botCanKick = true } = {}) {
   const state = { cfg: structuredClone(cfg), logs: [] };
   return {
     state,
@@ -23,7 +23,7 @@ function fakeApi({ cfg = baseConfig(), results = [], logFails = false, detected 
     saveConfig: (c) => {
       state.cfg = structuredClone(c);
     },
-    assessGuild: async () => ({ cfg: structuredClone(state.cfg), results, detectedPauseRoles: detected }),
+    assessGuild: async () => ({ cfg: structuredClone(state.cfg), results, detectedPauseRoles: detected, botCanKick }),
     detectedPauseRoles: async () => detected,
     hiddenChannels: async () => hidden,
     assessMember: async (id) => results.find((r) => r.member.id === id) ?? null,
@@ -82,7 +82,13 @@ test('ping replies with timing and connection state', async () => {
 });
 
 test('enable turns it on with a grace period and reports who is due', async () => {
-  const api = fakeApi({ results: [result('a', 'kick'), result('b', 'keep'), result('c', 'blocked')] });
+  const api = fakeApi({
+    results: [
+      result('a', 'kick', { kickable: true }),
+      result('b', 'keep', { kickable: true }),
+      result('c', 'blocked', { kickable: false }),
+    ],
+  });
   const reply = await runCommand(sub('enable'), api);
   assert.equal(api.state.cfg.enabled, true);
   assert.ok(api.state.cfg.armedAt > Date.now() + 59 * 60_000);
@@ -198,6 +204,58 @@ test("status warns about channels the bot can't see", async () => {
 
   const failing = { ...fakeApi(), hiddenChannels: async () => Promise.reject(new Error('nope')) };
   assert.match((await statusFields(failing)).fields["Channels I can't see"], /Couldn't check/);
+});
+
+test("status warns when the bot can't kick most members", async () => {
+  const member = (id, action, kickable, reason) => result(id, action, { kickable, reason });
+  const statusText = async (opts) => (await runCommand(sub('status'), fakeApi(opts))).content ?? '';
+
+  // 3 of 4 candidates can't be kicked; bots/owner/whitelisted don't count either way.
+  const mostlyBlocked = [
+    member('a', 'keep', false),
+    member('b', 'keep', false),
+    member('c', 'blocked', false),
+    member('d', 'keep', true),
+    member('bot', 'skip', false, 'bot'),
+    member('staff', 'protected', false, 'whitelisted role'),
+  ];
+  assert.match(await statusText({ results: mostlyBlocked }), /can't kick most members \(3 of 4\)/);
+  assert.match(await statusText({ results: mostlyBlocked, botCanKick: false }), /don't have the \*\*Kick Members\*\* permission/);
+
+  const fine = [member('a', 'keep', true), member('b', 'keep', true), member('c', 'keep', false)];
+  assert.doesNotMatch(await statusText({ results: fine }), /can't kick most/);
+  assert.doesNotMatch(await statusText({ results: [member('bot', 'skip', false, 'bot')] }), /Kick/, 'nobody to kick');
+
+  // enable shows it too, instead of the narrower "N inactive members" note
+  const enable = await runCommand(sub('enable'), fakeApi({ results: mostlyBlocked }));
+  assert.match(enable.content, /can't kick most members \(3 of 4\)/);
+  assert.doesNotMatch(enable.content, /inactive member can't be kicked/);
+});
+
+test('check always shows blacklist status and whether the bot can kick them', async () => {
+  const api = fakeApi({
+    results: [
+      result('a', 'keep', { kickable: true, remainingMs: DAY_MS, listed: { reason: 'blacklisted role', roleId: 'TRIAL' } }),
+      result('b', 'keep', { kickable: false, remainingMs: DAY_MS, listed: null }),
+      result('c', 'blocked', { kickable: false, listed: { reason: 'blacklisted member', roleId: null } }),
+      result('o', 'skip', { kickable: false, reason: 'server owner', listed: null }),
+    ],
+  });
+  const check = async (id) => (await runCommand(sub('check', [{ name: 'member', type: 6, value: id }]), api)).content;
+
+  const a = await check('a');
+  assert.match(a, /Blacklisted through the role <@&TRIAL>/);
+  assert.match(a, /I can kick them/);
+
+  const b = await check('b');
+  assert.doesNotMatch(b, /Blacklisted/);
+  assert.match(b, /I can't kick them: they have a role above mine/);
+
+  const c = await check('c');
+  assert.match(c, /Blacklisted \(as a member\)/);
+  assert.equal(c.match(/can't kick them/g).length, 1, 'not repeated for past-the-limit members');
+
+  assert.doesNotMatch(await check('o'), /I can|I can't kick/, 'owner line already says it');
 });
 
 test('check explains a paused clock', async () => {

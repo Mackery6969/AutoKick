@@ -204,6 +204,28 @@ const BLOCKED_HELP =
 const NOT_CONNECTED =
   "⚠️ I'm not connected to Discord right now, so new activity isn't being recorded. Open the bot's status page to see why.";
 
+/**
+ * Warning when the bot can't kick most of the members it might need to (not
+ * bots, the owner or whitelisted members): usually a missing Kick Members
+ * permission or the bot's role sitting too low. Returns null when it's fine.
+ */
+function kickPowerWarning(results, botCanKick) {
+  const candidates = results.filter((r) => r.result.action !== 'skip' && r.result.action !== 'protected');
+  if (!candidates.length) return null;
+  if (botCanKick === false) {
+    return (
+      "⚠️ I don't have the **Kick Members** permission, so I can't kick anyone. " +
+      'Give my role Kick Members in Server Settings → Roles.'
+    );
+  }
+  const unkickable = candidates.filter((r) => !r.result.kickable).length;
+  if (unkickable * 2 <= candidates.length) return null;
+  return (
+    `⚠️ I can't kick most members (${unkickable} of ${candidates.length}), probably because their roles are above mine. ` +
+    'Drag my role higher in Server Settings → Roles, above the roles of members who should be kickable.'
+  );
+}
+
 /** When the next kicks can happen, taking the post-enable grace period into account. */
 function firstKickAt(cfg, api) {
   return Math.max(cfg.armedAt ?? 0, api.nextSweepAt());
@@ -221,8 +243,9 @@ const handlers = {
       api.saveConfig(cfg);
       await api.log(`▶️ AutoKick turned on by <@${userId}>.`).catch(() => {});
     }
-    const { results } = await api.assessGuild();
+    const { results, botCanKick } = await api.assessGuild();
     const { due, blocked } = tally(results);
+    const powerWarning = kickPowerWarning(results, botCanKick);
 
     const lines = [
       wasOn ? '✅ AutoKick was already **on**.' : '✅ **AutoKick is on.**',
@@ -243,7 +266,8 @@ const handlers = {
     } else {
       lines.push('• Nobody is past the limit right now.');
     }
-    if (blocked.length) lines.push(`⚠️ ${plural(blocked.length, 'inactive member')} can't be kicked: ${BLOCKED_HELP}`);
+    if (powerWarning) lines.push(powerWarning);
+    else if (blocked.length) lines.push(`⚠️ ${plural(blocked.length, 'inactive member')} can't be kicked: ${BLOCKED_HELP}`);
     if (!api.connected()) lines.push(NOT_CONNECTED);
     return { content: lines.join('\n') };
   },
@@ -261,9 +285,10 @@ const handlers = {
   },
 
   async status({ api }) {
-    const { cfg, results, detectedPauseRoles } = await api.assessGuild();
+    const { cfg, results, detectedPauseRoles, botCanKick } = await api.assessGuild();
     const { due, blocked } = tally(results);
     const muted = results.filter((r) => r.result.action === 'paused').length;
+    const powerWarning = kickPowerWarning(results, botCanKick);
     const hidden = await api.hiddenChannels().catch(() => undefined);
     const now = Date.now();
     let state = 'Off';
@@ -298,6 +323,7 @@ const handlers = {
     };
     const warnings = [];
     if (!api.connected()) warnings.push(NOT_CONNECTED);
+    if (powerWarning) warnings.push(powerWarning);
     if (hidden?.length) {
       warnings.push(
         `⚠️ I can't see ${plural(hidden.length, 'channel')}, so activity there isn't tracked and people ` +
@@ -389,6 +415,16 @@ const handlers = {
         break;
       default:
         lines.push(result.reason === 'bot' ? '🤖 Bots are never kicked.' : '👑 The server owner is never kicked.');
+    }
+
+    // Admin-only details: blacklist and whether the bot could kick them at all.
+    if (result.listed?.reason === 'blacklisted member') {
+      lines.push("📛 Blacklisted (as a member), so whitelisted roles don't protect them.");
+    } else if (result.listed?.reason === 'blacklisted role') {
+      lines.push(`📛 Blacklisted through the role <@&${result.listed.roleId}>, so whitelisted roles don't protect them.`);
+    }
+    if (result.action !== 'skip' && result.action !== 'blocked') {
+      lines.push(result.kickable ? '👢 I can kick them.' : `🚫 I can't kick them: ${BLOCKED_HELP}`);
     }
     return { content: lines.join('\n') };
   },
