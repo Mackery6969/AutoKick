@@ -8,7 +8,7 @@
 // happen in alarm() or handleCommand(), each with its own request Budget.
 
 import { DurableObject } from 'cloudflare:workers';
-import { assess, DAY_MS, escapeMarkdown, formatDuration, pauseChanges } from './policy.js';
+import { assess, countsAsVoice, DAY_MS, escapeMarkdown, formatDuration, pauseChanges } from './policy.js';
 import {
   APP_FLAGS_MEMBERS_INTENT,
   Budget,
@@ -90,8 +90,14 @@ export class AutoKickBot extends DurableObject {
       guild_id TEXT NOT NULL, user_id TEXT NOT NULL, last_active INTEGER NOT NULL,
       PRIMARY KEY (guild_id, user_id))`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS voice (
-      guild_id TEXT NOT NULL, user_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+      guild_id TEXT NOT NULL, user_id TEXT NOT NULL, channel_id TEXT NOT NULL, deaf INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (guild_id, user_id))`);
+    try {
+      // Older versions created the table without the deafened flag.
+      this.sql.exec('ALTER TABLE voice ADD COLUMN deaf INTEGER NOT NULL DEFAULT 0');
+    } catch (err) {
+      if (!/duplicate column/i.test(err.message)) throw err;
+    }
     // Periods when a member was muted (kind 'timeout' or 'role'); ended_at is NULL while ongoing.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS pauses (
       guild_id TEXT NOT NULL, user_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -184,14 +190,17 @@ export class AutoKickBot extends DurableObject {
     this.lastWrite.set(key, ts);
   }
 
-  /** Everyone sitting in a voice channel (other than the AFK channel) counts as active right now. */
+  /** Everyone in a voice channel (not the AFK channel, not deafened) counts as active right now. */
   touchVoice(onlyGuildId = null) {
+    const query = 'SELECT guild_id, user_id, channel_id, deaf FROM voice';
     const rows = onlyGuildId
-      ? this.sql.exec('SELECT guild_id, user_id, channel_id FROM voice WHERE guild_id = ?', onlyGuildId).toArray()
-      : this.sql.exec('SELECT guild_id, user_id, channel_id FROM voice').toArray();
+      ? this.sql.exec(`${query} WHERE guild_id = ?`, onlyGuildId).toArray()
+      : this.sql.exec(query).toArray();
     const now = Date.now();
     for (const row of rows) {
-      if (row.channel_id !== this.afkChannel(row.guild_id)) this.touch(row.guild_id, row.user_id, now);
+      if (countsAsVoice(row.channel_id, Boolean(row.deaf), this.afkChannel(row.guild_id))) {
+        this.touch(row.guild_id, row.user_id, now);
+      }
     }
   }
 
@@ -550,7 +559,13 @@ export class AutoKickBot extends DurableObject {
     this.sql.exec('DELETE FROM voice WHERE guild_id = ?', d.id);
     for (const vs of d.voice_states ?? []) {
       if (vs.channel_id) {
-        this.sql.exec('INSERT INTO voice (guild_id, user_id, channel_id) VALUES (?, ?, ?)', d.id, vs.user_id, vs.channel_id);
+        this.sql.exec(
+          'INSERT INTO voice (guild_id, user_id, channel_id, deaf) VALUES (?, ?, ?, ?)',
+          d.id,
+          vs.user_id,
+          vs.channel_id,
+          vs.self_deaf || vs.deaf ? 1 : 0,
+        );
       }
     }
     this.touchVoice(d.id);
@@ -563,23 +578,29 @@ export class AutoKickBot extends DurableObject {
 
   onVoiceState(d) {
     if (!d.guild_id || d.member?.user?.bot) return;
-    const prev =
-      this.sql.exec('SELECT channel_id FROM voice WHERE guild_id = ? AND user_id = ?', d.guild_id, d.user_id).toArray()[0]
-        ?.channel_id ?? null;
+    const prev = this.sql
+      .exec('SELECT channel_id, deaf FROM voice WHERE guild_id = ? AND user_id = ?', d.guild_id, d.user_id)
+      .toArray()[0];
+    const prevChannel = prev?.channel_id ?? null;
+    const prevDeaf = Boolean(prev?.deaf);
+    const deaf = Boolean(d.self_deaf || d.deaf);
     const afk = this.afkChannel(d.guild_id);
-    const counts = (channelId) => Boolean(channelId) && channelId !== afk;
 
-    // Joining, leaving or switching channels all count as being in voice.
-    if (counts(prev) || counts(d.channel_id)) this.touch(d.guild_id, d.user_id);
+    // Joining, leaving, switching, deafening or undeafening: if they were (or now are)
+    // in voice in a way that counts, they're active right now.
+    if (countsAsVoice(prevChannel, prevDeaf, afk) || countsAsVoice(d.channel_id, deaf, afk)) {
+      this.touch(d.guild_id, d.user_id);
+    }
 
-    if (prev === d.channel_id) return; // mute/deafen changes only
+    if (prevChannel === d.channel_id && prevDeaf === deaf) return; // only mute/video/stream changed
     if (d.channel_id) {
       this.sql.exec(
-        `INSERT INTO voice (guild_id, user_id, channel_id) VALUES (?, ?, ?)
-         ON CONFLICT(guild_id, user_id) DO UPDATE SET channel_id = excluded.channel_id`,
+        `INSERT INTO voice (guild_id, user_id, channel_id, deaf) VALUES (?, ?, ?, ?)
+         ON CONFLICT(guild_id, user_id) DO UPDATE SET channel_id = excluded.channel_id, deaf = excluded.deaf`,
         d.guild_id,
         d.user_id,
         d.channel_id,
+        deaf ? 1 : 0,
       );
     } else {
       this.sql.exec('DELETE FROM voice WHERE guild_id = ? AND user_id = ?', d.guild_id, d.user_id);

@@ -5,7 +5,7 @@ A Discord bot that kicks members who haven't **sent a message** or **been in a v
 ## What counts as activity
 
 - Sending a message anywhere in the server: channels, threads, forum posts, replies.
-- Being in a voice channel: joining, leaving, switching, or just sitting in it. The server's AFK channel doesn't count.
+- Being in a voice channel: joining, leaving, switching, or just sitting in it. Being muted still counts. Being **deafened** doesn't (self-deafened or by a moderator), and neither does the server's AFK channel.
 
 ## Muted members
 

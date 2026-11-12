@@ -226,7 +226,7 @@ const handlers = {
       ],
       footer: {
         text:
-          'Activity = sending messages or being in a voice channel (not the AFK channel). ' +
+          'Activity = sending messages or being in a voice channel (not deafened, not the AFK channel). ' +
           "Time spent timed out or with a pause role doesn't count.",
       },
     };

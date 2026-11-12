@@ -6,6 +6,7 @@ import {
   formatDuration,
   lastActiveAt,
   listVerdict,
+  countsAsVoice,
   mergeIntervals,
   observedInactiveMs,
   pauseChanges,
@@ -149,6 +150,14 @@ test('pauseChanges: pause roles open and close a period', () => {
   assert.deepEqual(pauseChanges([open], muted, roles, now), [], 'already open');
   assert.deepEqual(pauseChanges([open], free, roles, now), [{ update: { id: 3, end: 1000 } }]);
   assert.deepEqual(pauseChanges([open], free, null, now), [], 'roles unknown: leave role periods alone');
+});
+
+test('countsAsVoice: in a channel, not AFK, not deafened', () => {
+  assert.equal(countsAsVoice('vc', false, 'afk'), true, 'in voice (muted or not)');
+  assert.equal(countsAsVoice('vc', true, 'afk'), false, 'deafened');
+  assert.equal(countsAsVoice('afk', false, 'afk'), false, 'AFK channel');
+  assert.equal(countsAsVoice(null, false, 'afk'), false, 'not in voice');
+  assert.equal(countsAsVoice('vc', false, null), true, 'server has no AFK channel');
 });
 
 test('formatDuration', () => {

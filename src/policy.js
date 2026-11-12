@@ -39,6 +39,14 @@ export function lastActiveAt(cfg, userId, joinedTimestamp) {
   return Math.max(cfg.activity[userId] ?? 0, cfg.trackingSince ?? 0, joinedTimestamp ?? 0);
 }
 
+/**
+ * Does being in this voice state count as activity? Not in the AFK channel,
+ * and not while deafened (by themselves or a moderator). Just muted still counts.
+ */
+export function countsAsVoice(channelId, deafened, afkChannelId) {
+  return Boolean(channelId) && channelId !== afkChannelId && !deafened;
+}
+
 /** Sort and merge overlapping [start, end] intervals so overlaps aren't subtracted twice. */
 export function mergeIntervals(intervals) {
   const sorted = intervals.filter(([s, e]) => e > s).sort((a, b) => a[0] - b[0]);
