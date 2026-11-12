@@ -26,6 +26,35 @@ function listGroup(name, description) {
       { type: SUB, name: 'add', description: `Add a role or member to the ${name}`, options: target('add') },
       { type: SUB, name: 'remove', description: `Remove a role or member from the ${name}`, options: target('remove') },
       { type: SUB, name: 'list', description: `Show the ${name}` },
+      { type: SUB, name: 'reset', description: `Clear the whole ${name}` },
+    ],
+  };
+}
+
+// Text, voice, category, announcement, threads, stage, forum, media.
+const LISTABLE_CHANNEL_TYPES = [0, 2, 4, 5, 10, 11, 12, 13, 15, 16];
+const CATEGORY = 4;
+
+function channelListGroup(name, description) {
+  const label = name.replace('-', ' ');
+  const channel = (verb) => [
+    {
+      type: CHANNEL,
+      name: 'channel',
+      description: `Channel, category or thread to ${verb}`,
+      required: true,
+      channel_types: LISTABLE_CHANNEL_TYPES,
+    },
+  ];
+  return {
+    type: GROUP,
+    name,
+    description,
+    options: [
+      { type: SUB, name: 'add', description: `Add a channel or category to the ${label}`, options: channel('add') },
+      { type: SUB, name: 'remove', description: `Remove a channel or category from the ${label}`, options: channel('remove') },
+      { type: SUB, name: 'list', description: `Show the ${label}` },
+      { type: SUB, name: 'reset', description: `Clear the whole ${label}` },
     ],
   };
 }
@@ -66,6 +95,8 @@ export const COMMANDS = [
       },
       listGroup('whitelist', 'Roles and members that are never auto-kicked'),
       listGroup('blacklist', 'Roles and members that can be kicked even with a whitelisted role'),
+      channelListGroup('channel-whitelist', 'If set, only activity in these channels/categories counts'),
+      channelListGroup('channel-blacklist', "Activity in these channels/categories doesn't count"),
       {
         type: GROUP,
         name: 'pause',
@@ -135,6 +166,21 @@ function formatPauseRoles(cfg, detected = []) {
   ];
   return items.length ? items.join(', ').slice(0, 1000) : 'None';
 }
+
+function formatChannelRules(cfg) {
+  const { whitelist, blacklist } = cfg.channels;
+  if (!whitelist.length && !blacklist.length) return 'Every channel counts';
+  const ids = (list) => list.map((id) => `<#${id}>`).join(', ');
+  const lines = [];
+  if (whitelist.length) lines.push(`Only: ${ids(whitelist)}`);
+  if (blacklist.length) lines.push(`Ignored: ${ids(blacklist)}`);
+  return lines.join('\n').slice(0, 1000);
+}
+
+const CHANNEL_RULES =
+  'Blacklisted channels never count. If the channel whitelist has anything in it, only whitelisted channels count. ' +
+  'A category covers every channel in it, and threads follow their channel. The most specific entry wins, ' +
+  'so you can blacklist a category but whitelist one channel inside it.';
 
 const BLOCKED_HELP =
   "they have a role above mine (or I'm missing Kick Members). Drag my role higher in Server Settings → Roles.";
@@ -223,6 +269,7 @@ const handlers = {
         { name: 'Whitelist (never kicked)', value: formatList(cfg.whitelist) },
         { name: 'Blacklist (kickable even with a whitelisted role)', value: formatList(cfg.blacklist) },
         { name: 'Pause roles (plus anyone timed out)', value: formatPauseRoles(cfg, detectedPauseRoles) },
+        { name: 'Channels where activity counts', value: formatChannelRules(cfg) },
       ],
       footer: {
         text:
@@ -387,6 +434,22 @@ async function editList({ api, opts, interaction, userId }, listName, action) {
     return { embeds: [{ title, color: COLOR, description: formatList(cfg[listName]) }] };
   }
 
+  if (action === 'reset') {
+    const count = cfg[listName].roles.length + cfg[listName].users.length;
+    if (!count) return { content: `The ${listName} is already empty.` };
+    const cleared = formatList(cfg[listName]);
+    cfg[listName] = { roles: [], users: [] };
+    let grace = '';
+    if (listName === 'whitelist' && cfg.enabled) {
+      // People who were protected may now be past the limit: same one-hour window as enabling.
+      cfg.armedAt = Math.max(cfg.armedAt ?? 0, Date.now() + api.enableGraceMs);
+      grace = ` Anyone who was protected can't be kicked before ${ts(cfg.armedAt)}.`;
+    }
+    api.saveConfig(cfg);
+    await api.log(`⚙️ <@${userId}> cleared the ${listName}.`).catch(() => {});
+    return { content: `✅ Cleared the ${listName} (${count} ${count === 1 ? 'entry' : 'entries'}: ${cleared}).${grace}` };
+  }
+
   const id = opts.target;
   const isRole = Boolean(interaction.data.resolved?.roles?.[id]);
   if (isRole && id === interaction.guild_id) {
@@ -464,6 +527,70 @@ async function editPauseRoles({ api, opts, interaction, userId }, action) {
   return { content: `✅ ${mention} is no longer a pause role.${still}` };
 }
 
+const CHANNEL_LISTS = { 'channel-whitelist': 'whitelist', 'channel-blacklist': 'blacklist' };
+
+async function editChannelList({ api, opts, interaction, userId }, group, action) {
+  const listName = CHANNEL_LISTS[group];
+  const other = listName === 'whitelist' ? 'blacklist' : 'whitelist';
+  const label = `channel ${listName}`;
+  const cfg = api.getConfig();
+  const list = cfg.channels[listName];
+
+  if (action === 'list') {
+    const title = listName === 'whitelist' ? 'Channel whitelist (only these count)' : "Channel blacklist (these don't count)";
+    const items = list.length ? list.map((id) => `<#${id}>`).join(', ').slice(0, 3000) : 'None';
+    return { embeds: [{ title, color: COLOR, description: `${items}\n\n${CHANNEL_RULES}` }] };
+  }
+
+  if (action === 'reset') {
+    if (!list.length) return { content: `The ${label} is already empty.` };
+    const count = list.length;
+    cfg.channels[listName] = [];
+    api.saveConfig(cfg);
+    await api.log(`⚙️ <@${userId}> cleared the ${label}.`).catch(() => {});
+    const everywhere = cfg.channels.whitelist.length || cfg.channels.blacklist.length ? '' : ' Activity in every channel counts again.';
+    return { content: `✅ Cleared the ${label} (${plural(count, 'channel')}).${everywhere}` };
+  }
+
+  const id = opts.channel;
+  const resolved = interaction.data.resolved?.channels?.[id];
+  const where =
+    resolved?.type === CATEGORY ? `the **${escapeMarkdown(resolved.name)}** category (every channel in it)` : `<#${id}>`;
+
+  if (action === 'add') {
+    if (list.includes(id)) return { content: `${where} is already on the ${label}.` };
+    const firstWhitelisted = listName === 'whitelist' && list.length === 0;
+    list.push(id);
+    const moved = cfg.channels[other].includes(id);
+    cfg.channels[other] = cfg.channels[other].filter((x) => x !== id);
+    api.saveConfig(cfg);
+    await api.log(`⚙️ <@${userId}> added <#${id}> to the ${label}.`).catch(() => {});
+
+    const lines = [
+      (listName === 'whitelist' ? `✅ Activity in ${where} counts.` : `✅ Activity in ${where} no longer counts.`) +
+        (moved ? ` (Removed it from the channel ${other}.)` : ''),
+    ];
+    if (firstWhitelisted) {
+      lines.push(
+        '⚠️ This is the first whitelisted channel, so from now on **only** activity in whitelisted channels counts. ' +
+          'Use `/autokick channel-whitelist reset` to undo.',
+      );
+    }
+    lines.push('This only affects activity from now on; activity already recorded stays.');
+    return { content: lines.join('\n') };
+  }
+
+  if (!list.includes(id)) return { content: `${where} isn't on the ${label}.` };
+  cfg.channels[listName] = list.filter((x) => x !== id);
+  api.saveConfig(cfg);
+  await api.log(`⚙️ <@${userId}> removed <#${id}> from the ${label}.`).catch(() => {});
+  const nowEmpty =
+    listName === 'whitelist' && !cfg.channels.whitelist.length
+      ? ' The channel whitelist is now empty, so activity counts everywhere except blacklisted channels.'
+      : '';
+  return { content: `✅ Removed ${where} from the ${label}.${nowEmpty}` };
+}
+
 /** Discord IDs encode their creation time. */
 const snowflakeTime = (id) => Number((BigInt(id) >> 22n) + 1420070400000n);
 
@@ -515,6 +642,7 @@ export async function runCommand(interaction, api) {
     opts: Object.fromEntries((sub?.options ?? []).map((o) => [o.name, o.value])),
   };
   if (group === 'pause') return editPauseRoles(ctx, sub.name);
+  if (Object.hasOwn(CHANNEL_LISTS, group ?? '')) return editChannelList(ctx, group, sub.name);
   if (group) return editList(ctx, group, sub.name);
   const handler = handlers[sub.name];
   return handler ? handler(ctx) : { content: 'Unknown command.' };

@@ -40,6 +40,23 @@ export function lastActiveAt(cfg, userId, joinedTimestamp) {
 }
 
 /**
+ * Does activity in this channel count? `chain` is the channel followed by its
+ * parents, most specific first: thread → channel → category.
+ * The most specific listed entry wins, so a whitelisted channel inside a
+ * blacklisted category counts, and a blacklisted channel inside a whitelisted
+ * category doesn't. If nothing in the chain is listed: counts unless a channel
+ * whitelist exists (then only whitelisted places count).
+ */
+export function channelCounts(cfg, chain) {
+  const { whitelist = [], blacklist = [] } = cfg?.channels ?? {};
+  for (const id of chain) {
+    if (blacklist.includes(id)) return false;
+    if (whitelist.includes(id)) return true;
+  }
+  return whitelist.length === 0;
+}
+
+/**
  * Does being in this voice state count as activity? Not in the AFK channel,
  * and not while deafened (by themselves or a moderator). Just muted still counts.
  */

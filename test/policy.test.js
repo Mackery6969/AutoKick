@@ -6,6 +6,7 @@ import {
   formatDuration,
   lastActiveAt,
   listVerdict,
+  channelCounts,
   countsAsVoice,
   mergeIntervals,
   observedInactiveMs,
@@ -150,6 +151,20 @@ test('pauseChanges: pause roles open and close a period', () => {
   assert.deepEqual(pauseChanges([open], muted, roles, now), [], 'already open');
   assert.deepEqual(pauseChanges([open], free, roles, now), [{ update: { id: 3, end: 1000 } }]);
   assert.deepEqual(pauseChanges([open], free, null, now), [], 'roles unknown: leave role periods alone');
+});
+
+test('channelCounts: blacklist, whitelist, categories and threads', () => {
+  const rules = (whitelist, blacklist) => ({ channels: { whitelist, blacklist } });
+  // chain = [thread or channel, ..., category], most specific first
+  assert.equal(channelCounts(rules([], []), ['general', 'cat']), true, 'no lists: everything counts');
+  assert.equal(channelCounts(undefined, ['general']), true, 'no config yet');
+  assert.equal(channelCounts(rules([], ['spam']), ['spam', 'cat']), false, 'blacklisted channel');
+  assert.equal(channelCounts(rules([], ['cat']), ['general', 'cat']), false, 'blacklisted category covers its channels');
+  assert.equal(channelCounts(rules([], ['spam']), ['thread', 'spam', 'cat']), false, 'threads follow their channel');
+  assert.equal(channelCounts(rules(['chat'], []), ['general', 'cat']), false, 'whitelist set: others ignored');
+  assert.equal(channelCounts(rules(['chat'], []), ['thread', 'chat', 'cat']), true, 'thread in a whitelisted channel');
+  assert.equal(channelCounts(rules(['general'], ['cat']), ['general', 'cat']), true, 'whitelisted channel in blacklisted category');
+  assert.equal(channelCounts(rules(['cat'], ['spam']), ['spam', 'cat']), false, 'blacklisted channel in whitelisted category');
 });
 
 test('countsAsVoice: in a channel, not AFK, not deafened', () => {

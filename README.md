@@ -6,6 +6,7 @@ A Discord bot that kicks members who haven't **sent a message** or **been in a v
 
 - Sending a message anywhere in the server: channels, threads, forum posts, replies.
 - Being in a voice channel: joining, leaving, switching, or just sitting in it. Being muted still counts. Being **deafened** doesn't (self-deafened or by a moderator), and neither does the server's AFK channel.
+- You can limit which channels count with the [channel whitelist and blacklist](#channel-whitelist-and-blacklist).
 
 ## Muted members
 
@@ -40,8 +41,10 @@ All commands are under `/autokick`. By default only members with **Manage Server
 | `/autokick check member:` | One member's last activity and status |
 | `/autokick days days:` | Change the limit (1–365 days, default 30) |
 | `/autokick logchannel [channel:]` | Post kicks and setting changes in a channel (leave empty to turn off) |
-| `/autokick whitelist add/remove/list` | Roles or members that are never kicked |
-| `/autokick blacklist add/remove/list` | Roles or members that can be kicked even if they have a whitelisted role |
+| `/autokick whitelist add/remove/list/reset` | Roles or members that are never kicked |
+| `/autokick blacklist add/remove/list/reset` | Roles or members that can be kicked even if they have a whitelisted role |
+| `/autokick channel-whitelist add/remove/list/reset` | If set, only activity in these channels/categories counts |
+| `/autokick channel-blacklist add/remove/list/reset` | Activity in these channels/categories doesn't count |
 | `/autokick pause add/remove/list` | Roles that pause a member's clock while they have them (timeouts always do) |
 | `/activity [member:]` | When you (or another member) last sent a message or was in voice (anyone can use it) |
 | `/ping` | Check the bot is online and replying (anyone can use it) |
@@ -57,6 +60,19 @@ Everyone is checked for inactivity unless the whitelist protects them. When rule
 5. Otherwise → kicked once inactive past the limit.
 
 Example: whitelist `@Members`, blacklist `@Trial`. Inactive members with `@Members` are safe, unless they also have `@Trial`.
+
+`reset` clears a whole list. Clearing the whitelist while AutoKick is on restarts the one-hour grace period, so people who were protected aren't kicked straight away.
+
+### Channel whitelist and blacklist
+
+These control **where activity counts**, for messages and voice alike:
+
+- **Blacklisted** channels never count, for example a counting or spam channel.
+- If the **channel whitelist** has anything in it, *only* whitelisted channels count.
+- A **category** covers every channel in it, and **threads and forum posts** follow their channel.
+- The most specific entry wins. You can blacklist a whole category but whitelist one channel inside it.
+
+Changes only affect activity from then on; activity already recorded stays. The bot only sees messages in channels it has **View Channel** access to, so make sure it can see every channel that should count.
 
 ## Invite
 

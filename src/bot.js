@@ -8,7 +8,15 @@
 // happen in alarm() or handleCommand(), each with its own request Budget.
 
 import { DurableObject } from 'cloudflare:workers';
-import { assess, countsAsVoice, DAY_MS, escapeMarkdown, formatDuration, pauseChanges } from './policy.js';
+import {
+  assess,
+  channelCounts,
+  countsAsVoice,
+  DAY_MS,
+  escapeMarkdown,
+  formatDuration,
+  pauseChanges,
+} from './policy.js';
 import {
   APP_FLAGS_MEMBERS_INTENT,
   Budget,
@@ -77,6 +85,7 @@ function defaultConfig(now) {
     whitelist: { roles: [], users: [] },
     blacklist: { roles: [], users: [] },
     pauseRoles: [], // members with these roles don't lose time (plus auto-detected "Muted" roles)
+    channels: { whitelist: [], blacklist: [] }, // where activity counts (channels, categories, threads)
   };
 }
 
@@ -117,6 +126,7 @@ export class AutoKickBot extends DurableObject {
     this.recent = new Map(); // guildId -> Map<userId, exact last activity time> (memory only)
     this.guildCache = new Map(); // guildId -> guildMeta (roles, owner, AFK channel)
     this.memberCache = new Map(); // guildId -> { fetchedAt, members: Map<userId, record> }
+    this.channelParents = new Map(); // guildId -> Map<channelId, parentId|null> (thread → channel → category)
     this.kickFailures = new Map(); // "guild:user" -> time of last failed kick
   }
 
@@ -172,6 +182,23 @@ export class AutoKickBot extends DurableObject {
     return row?.meta ? JSON.parse(row.meta).afkChannelId : null;
   }
 
+  setChannelParents(guildId, channels) {
+    this.channelParents.set(guildId, new Map(channels.map((c) => [c.id, c.parent_id ?? null])));
+  }
+
+  /** The channel followed by its parents, most specific first: thread → channel → category. */
+  channelChain(guildId, channelId) {
+    const parents = this.channelParents.get(guildId);
+    const chain = [];
+    for (let id = channelId; id && chain.length < 4; id = parents?.get(id) ?? null) chain.push(id);
+    return chain;
+  }
+
+  /** Does activity in this channel count, given the channel whitelist/blacklist? */
+  countsInChannel(guildId, channelId, cfg = this.getConfig(guildId)) {
+    return channelCounts(cfg, this.channelChain(guildId, channelId));
+  }
+
   touch(guildId, userId, ts = Date.now()) {
     // Exact time in memory; storage is only updated hourly to save writes.
     if (!this.recent.has(guildId)) this.recent.set(guildId, new Map());
@@ -197,8 +224,16 @@ export class AutoKickBot extends DurableObject {
       ? this.sql.exec(`${query} WHERE guild_id = ?`, onlyGuildId).toArray()
       : this.sql.exec(query).toArray();
     const now = Date.now();
+    const configs = new Map();
+    const configFor = (guildId) => {
+      if (!configs.has(guildId)) configs.set(guildId, this.getConfig(guildId));
+      return configs.get(guildId);
+    };
     for (const row of rows) {
-      if (countsAsVoice(row.channel_id, Boolean(row.deaf), this.afkChannel(row.guild_id))) {
+      if (
+        countsAsVoice(row.channel_id, Boolean(row.deaf), this.afkChannel(row.guild_id)) &&
+        this.countsInChannel(row.guild_id, row.channel_id, configFor(row.guild_id))
+      ) {
         this.touch(row.guild_id, row.user_id, now);
       }
     }
@@ -266,6 +301,7 @@ export class AutoKickBot extends DurableObject {
     this.sql.exec('DELETE FROM voice WHERE guild_id = ?', guildId);
     this.sql.exec('DELETE FROM pauses WHERE guild_id = ?', guildId);
     this.recent.delete(guildId);
+    this.channelParents.delete(guildId);
     this.guildCache.delete(guildId);
     this.memberCache.delete(guildId);
   }
@@ -505,6 +541,20 @@ export class AutoKickBot extends DurableObject {
       }
       case 'GUILD_MEMBER_REMOVE':
         return this.forgetMember(d.guild_id, d.user.id);
+      // Keep the channel → category / thread → channel map current (for the channel lists).
+      case 'CHANNEL_CREATE':
+      case 'CHANNEL_UPDATE':
+      case 'THREAD_CREATE':
+      case 'THREAD_UPDATE':
+        if (d.guild_id) this.channelParents.get(d.guild_id)?.set(d.id, d.parent_id ?? null);
+        return;
+      case 'CHANNEL_DELETE':
+      case 'THREAD_DELETE':
+        if (d.guild_id) this.channelParents.get(d.guild_id)?.delete(d.id);
+        return;
+      case 'THREAD_LIST_SYNC':
+        for (const thread of d.threads ?? []) this.channelParents.get(d.guild_id)?.set(thread.id, thread.parent_id ?? null);
+        return;
       case 'MESSAGE_CREATE':
         return this.onMessage(d);
       case 'VOICE_STATE_UPDATE':
@@ -554,6 +604,7 @@ export class AutoKickBot extends DurableObject {
     this.saveMeta(d);
     this.guildCache.set(d.id, guildMeta(d));
     this.memberCache.delete(d.id);
+    this.setChannelParents(d.id, [...(d.channels ?? []), ...(d.threads ?? [])]);
 
     // Replace the voice snapshot for this server.
     this.sql.exec('DELETE FROM voice WHERE guild_id = ?', d.id);
@@ -573,6 +624,7 @@ export class AutoKickBot extends DurableObject {
 
   onMessage(d) {
     if (!d.guild_id || d.author?.bot || d.webhook_id || !COUNTED_MESSAGE_TYPES.has(d.type)) return;
+    if (!this.countsInChannel(d.guild_id, d.channel_id)) return; // channel whitelist/blacklist
     this.touch(d.guild_id, d.author.id);
   }
 
@@ -585,10 +637,13 @@ export class AutoKickBot extends DurableObject {
     const prevDeaf = Boolean(prev?.deaf);
     const deaf = Boolean(d.self_deaf || d.deaf);
     const afk = this.afkChannel(d.guild_id);
+    const cfg = this.getConfig(d.guild_id);
+    const counts = (channelId, deafened) =>
+      countsAsVoice(channelId, deafened, afk) && this.countsInChannel(d.guild_id, channelId, cfg);
 
     // Joining, leaving, switching, deafening or undeafening: if they were (or now are)
     // in voice in a way that counts, they're active right now.
-    if (countsAsVoice(prevChannel, prevDeaf, afk) || countsAsVoice(d.channel_id, deaf, afk)) {
+    if (counts(prevChannel, prevDeaf) || counts(d.channel_id, deaf)) {
       this.touch(d.guild_id, d.user_id);
     }
 
@@ -731,12 +786,20 @@ export class AutoKickBot extends DurableObject {
     return { member, result: this.assessWith(full, meta, botMember, member, pauses.get(userId) ?? [], ctx) };
   }
 
-  /** After a restart, fetch each server's roles so pause roles are recognised in real time. */
+  /**
+   * After a restart, fetch each server's roles and channels so pause roles and
+   * the channel lists (threads and categories included) work in real time.
+   */
   async loadMissingGuildMeta(budget) {
     for (const { id } of this.sql.exec('SELECT id FROM guilds').toArray()) {
-      if (this.guildCache.has(id) || budget.remaining < 20) continue;
+      if (budget.remaining < 20) return;
       try {
-        await this.getMeta(id, budget);
+        if (!this.guildCache.has(id)) await this.getMeta(id, budget);
+        if (!this.channelParents.has(id)) {
+          const channels = await this.rest('GET', `/guilds/${id}/channels`, { budget });
+          const { threads = [] } = await this.rest('GET', `/guilds/${id}/threads/active`, { budget });
+          this.setChannelParents(id, [...channels, ...threads]);
+        }
       } catch (err) {
         if (err instanceof BudgetExceeded) throw err;
         console.warn(`Could not load server ${id}: ${err.message}`);

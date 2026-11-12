@@ -12,6 +12,7 @@ const baseConfig = () => ({
   whitelist: { roles: [], users: [] },
   blacklist: { roles: [], users: [] },
   pauseRoles: [],
+  channels: { whitelist: [], blacklist: [] },
 });
 
 function fakeApi({ cfg = baseConfig(), results = [], logFails = false, detected = [] } = {}) {
@@ -211,6 +212,64 @@ test('/activity shows last activity for you or another member', async () => {
   assert.doesNotMatch(other, /whitelist|protected/i, 'no moderation details for members');
   assert.match((await runCommand(cmd('quiet'), api)).content, /hasn't sent a message or been in voice since I started tracking/);
   assert.match((await runCommand(cmd('ghost'), api)).content, /isn't in this server/);
+});
+
+const channelCmd = (group, name, channel, resolved) => ({
+  guild_id: 'G',
+  member: { user: { id: 'admin' } },
+  data: {
+    name: 'autokick',
+    options: [{ type: 2, name: group, options: [{ type: 1, name, options: channel ? [{ name: 'channel', type: 7, value: channel }] : [] }] }],
+    resolved: resolved ? { channels: resolved } : undefined,
+  },
+});
+
+test('channel blacklist and whitelist: add, move, remove, list, reset', async () => {
+  const api = fakeApi();
+  const spam = await runCommand(channelCmd('channel-blacklist', 'add', 'C1', { C1: { id: 'C1', type: 0, name: 'spam' } }), api);
+  assert.deepEqual(api.state.cfg.channels.blacklist, ['C1']);
+  assert.match(spam.content, /<#C1> no longer counts/);
+
+  const cat = await runCommand(channelCmd('channel-blacklist', 'add', 'K1', { K1: { id: 'K1', type: 4, name: 'Bots' } }), api);
+  assert.match(cat.content, /\*\*Bots\*\* category \(every channel in it\)/);
+
+  const first = await runCommand(channelCmd('channel-whitelist', 'add', 'C1', { C1: { id: 'C1', type: 0, name: 'spam' } }), api);
+  assert.deepEqual(api.state.cfg.channels.whitelist, ['C1']);
+  assert.deepEqual(api.state.cfg.channels.blacklist, ['K1'], 'moved off the blacklist');
+  assert.match(first.content, /Removed it from the channel blacklist/);
+  assert.match(first.content, /first whitelisted channel/);
+
+  const list = await runCommand(channelCmd('channel-whitelist', 'list'), api);
+  assert.match(list.embeds[0].description, /^<#C1>/);
+
+  const removed = await runCommand(channelCmd('channel-whitelist', 'remove', 'C1'), api);
+  assert.match(removed.content, /whitelist is now empty/);
+
+  const reset = await runCommand(channelCmd('channel-blacklist', 'reset'), api);
+  assert.deepEqual(api.state.cfg.channels.blacklist, []);
+  assert.match(reset.content, /Cleared the channel blacklist \(1 channel\)\. Activity in every channel counts again/);
+  assert.match((await runCommand(channelCmd('channel-blacklist', 'reset'), api)).content, /already empty/);
+});
+
+test('whitelist reset clears it and re-arms the grace period while on', async () => {
+  const cfg = { ...baseConfig(), enabled: true, armedAt: Date.now() - DAY_MS };
+  cfg.whitelist = { roles: ['STAFF'], users: ['U1'] };
+  const api = fakeApi({ cfg });
+  const reply = await runCommand(listCmd('whitelist', 'reset'), api);
+  assert.deepEqual(api.state.cfg.whitelist, { roles: [], users: [] });
+  assert.ok(api.state.cfg.armedAt > Date.now() + 59 * 60_000);
+  assert.match(reply.content, /Cleared the whitelist \(2 entries: <@&STAFF>, <@U1>\)/);
+  assert.match(reply.content, /can't be kicked before/);
+});
+
+test('blacklist reset clears it without touching the grace period', async () => {
+  const cfg = { ...baseConfig(), enabled: true, armedAt: null };
+  cfg.blacklist = { roles: [], users: ['U1'] };
+  const api = fakeApi({ cfg });
+  const reply = await runCommand(listCmd('blacklist', 'reset'), api);
+  assert.deepEqual(api.state.cfg.blacklist, { roles: [], users: [] });
+  assert.equal(api.state.cfg.armedAt, null);
+  assert.match(reply.content, /Cleared the blacklist \(1 entry: <@U1>\)\.$/);
 });
 
 test('check explains protection', async () => {
