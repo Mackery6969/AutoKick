@@ -1,0 +1,22 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "autokick",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-01",
+
+  // One Durable Object instance holds the Discord connection and all data.
+  "durable_objects": {
+    "bindings": [{ "name": "AUTOKICK", "class_name": "AutoKickBot" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AutoKickBot"] }],
+
+  // Safety net: every 5 minutes, make sure the bot is running.
+  "triggers": { "crons": ["*/5 * * * *"] },
+
+  // Logs show up in the Cloudflare dashboard under Workers & Pages → autokick → Logs.
+  "observability": { "enabled": true }
+
+  // Secrets (set with `npx wrangler secret put <NAME>`, never commit them):
+  //   DISCORD_TOKEN       Bot token (Developer Portal → Bot → Reset Token)
+  //   DISCORD_PUBLIC_KEY  Public key (Developer Portal → General Information)
+}

@@ -1,0 +1,4 @@
+# Only used by `npm run dev` (local testing). Copy to .dev.vars and fill in.
+# For the real deployment, use `npx wrangler secret put DISCORD_TOKEN` etc. instead.
+DISCORD_TOKEN=your-bot-token
+DISCORD_PUBLIC_KEY=your-application-public-key
