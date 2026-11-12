@@ -1,0 +1,18 @@
+# Dependabot opens pull requests to keep dependencies up to date.
+# https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+version: 2
+updates:
+  # npm: wrangler (the Cloudflare deploy tool) is the only dependency.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    # Only suggest releases that have been out for a few days, so a broken or
+    # compromised release has time to be caught and pulled first.
+    # (Security fixes ignore this and arrive right away.)
+    cooldown:
+      default-days: 5
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
