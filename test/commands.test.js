@@ -15,7 +15,7 @@ const baseConfig = () => ({
   channels: { whitelist: [], blacklist: [] },
 });
 
-function fakeApi({ cfg = baseConfig(), results = [], logFails = false, detected = [] } = {}) {
+function fakeApi({ cfg = baseConfig(), results = [], logFails = false, detected = [], hidden = [] } = {}) {
   const state = { cfg: structuredClone(cfg), logs: [] };
   return {
     state,
@@ -25,6 +25,7 @@ function fakeApi({ cfg = baseConfig(), results = [], logFails = false, detected 
     },
     assessGuild: async () => ({ cfg: structuredClone(state.cfg), results, detectedPauseRoles: detected }),
     detectedPauseRoles: async () => detected,
+    hiddenChannels: async () => hidden,
     assessMember: async (id) => results.find((r) => r.member.id === id) ?? null,
     log: async (text) => {
       if (logFails) throw new Error('Missing Access');
@@ -179,6 +180,24 @@ test('status counts muted members and shows pause roles', async () => {
   assert.equal(fields['Muted right now (clock paused)'], '1');
   assert.equal(fields['Past the limit'], '1');
   assert.equal(fields['Pause roles (plus anyone timed out)'], '<@&MUTED> (auto)');
+});
+
+test("status warns about channels the bot can't see", async () => {
+  const statusFields = async (api) => {
+    const reply = await runCommand(sub('status'), api);
+    return { reply, fields: Object.fromEntries(reply.embeds[0].fields.map((f) => [f.name, f.value])) };
+  };
+
+  const hidden = await statusFields(fakeApi({ hidden: ['C1', 'C2'] }));
+  assert.match(hidden.reply.content, /I can't see 2 channels/);
+  assert.match(hidden.fields["Channels I can't see"], /^<#C1>, <#C2>\nGive my role \*\*View Channel\*\*/);
+
+  const clear = await statusFields(fakeApi());
+  assert.equal(clear.reply.content, undefined);
+  assert.match(clear.fields["Channels I can't see"], /None/);
+
+  const failing = { ...fakeApi(), hiddenChannels: async () => Promise.reject(new Error('nope')) };
+  assert.match((await statusFields(failing)).fields["Channels I can't see"], /Couldn't check/);
 });
 
 test('check explains a paused clock', async () => {

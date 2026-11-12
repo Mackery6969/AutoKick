@@ -159,6 +159,40 @@ export function canKick(meta, botMember, target) {
   return highestPosition(meta, botMember.roleIds) > highestPosition(meta, target.roleIds);
 }
 
+export const PERM_VIEW_CHANNEL = 1n << 10n;
+
+/**
+ * Can the bot see this channel? Follows Discord's permission order: server-wide
+ * role permissions, then the channel's @everyone overwrite, then role overwrites
+ * (combined), then an overwrite for the bot itself. Administrator sees everything.
+ * `channel` is a channel object from the API (with permission_overwrites).
+ */
+export function canViewChannel(meta, botMember, channel) {
+  let perms = meta.roles.get(meta.id)?.permissions ?? 0n;
+  for (const id of botMember.roleIds) perms |= meta.roles.get(id)?.permissions ?? 0n;
+  if (perms & PERM_ADMINISTRATOR) return true;
+
+  const overwrites = channel.permission_overwrites ?? [];
+  const apply = (o) => {
+    perms &= ~BigInt(o.deny);
+    perms |= BigInt(o.allow);
+  };
+  const everyone = overwrites.find((o) => o.id === meta.id);
+  if (everyone) apply(everyone);
+  let allow = 0n;
+  let deny = 0n;
+  for (const o of overwrites) {
+    if (Number(o.type) === 0 && o.id !== meta.id && botMember.roleIds.includes(o.id)) {
+      allow |= BigInt(o.allow);
+      deny |= BigInt(o.deny);
+    }
+  }
+  apply({ allow, deny });
+  const own = overwrites.find((o) => Number(o.type) === 1 && o.id === botMember.id);
+  if (own) apply(own);
+  return Boolean(perms & PERM_VIEW_CHANNEL);
+}
+
 /** True if the bot has Kick Members at all (ignores role order). */
 export function botHasKickPermission(meta, botMember) {
   if (!botMember) return false;

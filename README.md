@@ -72,7 +72,7 @@ These control **where activity counts**, for messages and voice alike:
 - A **category** covers every channel in it, and **threads and forum posts** follow their channel.
 - The most specific entry wins. You can blacklist a whole category but whitelist one channel inside it.
 
-Changes only affect activity from then on; activity already recorded stays. The bot only sees messages in channels it has **View Channel** access to, so make sure it can see every channel that should count.
+Changes only affect activity from then on; activity already recorded stays. The bot only sees messages in channels it has **View Channel** access to, so make sure it can see every channel that should count. `/autokick status` warns about any channel it can't see, leaving out channels your channel lists already ignore.
 
 ## Invite
 

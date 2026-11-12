@@ -177,6 +177,23 @@ function formatChannelRules(cfg) {
   return lines.join('\n').slice(0, 1000);
 }
 
+/** `hidden`: channel ids, null (bot's own roles unknown) or undefined (check failed). */
+function formatHidden(hidden) {
+  if (!hidden) return "Couldn't check right now.";
+  if (!hidden.length) return 'None ✅ I can see every channel that counts.';
+  const help = '\nGive my role **View Channel** in these (or give me Administrator).';
+  let text = '';
+  for (const [i, id] of hidden.entries()) {
+    const item = `<#${id}>`;
+    if (text.length + item.length + help.length > 980) {
+      text += ` …and ${hidden.length - i} more`;
+      break;
+    }
+    text += (text ? ', ' : '') + item;
+  }
+  return text + help;
+}
+
 const CHANNEL_RULES =
   'Blacklisted channels never count. If the channel whitelist has anything in it, only whitelisted channels count. ' +
   'A category covers every channel in it, and threads follow their channel. The most specific entry wins, ' +
@@ -247,6 +264,7 @@ const handlers = {
     const { cfg, results, detectedPauseRoles } = await api.assessGuild();
     const { due, blocked } = tally(results);
     const muted = results.filter((r) => r.result.action === 'paused').length;
+    const hidden = await api.hiddenChannels().catch(() => undefined);
     const now = Date.now();
     let state = 'Off';
     if (cfg.enabled) state = cfg.armedAt > now ? `On (kicks start ${ts(cfg.armedAt)})` : 'On';
@@ -270,6 +288,7 @@ const handlers = {
         { name: 'Blacklist (kickable even with a whitelisted role)', value: formatList(cfg.blacklist) },
         { name: 'Pause roles (plus anyone timed out)', value: formatPauseRoles(cfg, detectedPauseRoles) },
         { name: 'Channels where activity counts', value: formatChannelRules(cfg) },
+        { name: "Channels I can't see", value: formatHidden(hidden) },
       ],
       footer: {
         text:
@@ -277,8 +296,15 @@ const handlers = {
           "Time spent timed out or with a pause role doesn't count.",
       },
     };
-    const content = api.connected() ? undefined : NOT_CONNECTED;
-    return { content, embeds: [embed] };
+    const warnings = [];
+    if (!api.connected()) warnings.push(NOT_CONNECTED);
+    if (hidden?.length) {
+      warnings.push(
+        `⚠️ I can't see ${plural(hidden.length, 'channel')}, so activity there isn't tracked and people ` +
+          'who only talk there will look inactive. Details below.',
+      );
+    }
+    return { content: warnings.join('\n') || undefined, embeds: [embed] };
   },
 
   async preview({ api }) {

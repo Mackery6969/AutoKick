@@ -22,6 +22,7 @@ import {
   Budget,
   BudgetExceeded,
   canKick,
+  canViewChannel,
   detectedPauseRoleIds,
   discordRest,
   editOriginalReply,
@@ -48,6 +49,8 @@ const KICK_RETRY_MS = 6 * 60 * 60_000;
 const REQUEST_BUDGET = 44; // leaves headroom under the free plan's 50
 const DEFAULT_GATEWAY = 'wss://gateway.discord.gg';
 const COUNTED_MESSAGE_TYPES = new Set([0, 18, 19]); // normal message, thread created, reply
+// Channels where people can be active: text, voice, announcement, stage, forum, media.
+const ACTIVITY_CHANNEL_TYPES = new Set([0, 2, 5, 13, 15, 16]);
 
 // Shown under the bot's name in Discord: "Watching Activity..." (activity type 3 = Watching).
 const PRESENCE = { since: null, activities: [{ name: 'Activity...', type: 3 }], status: 'online', afk: false };
@@ -787,6 +790,30 @@ export class AutoKickBot extends DurableObject {
   }
 
   /**
+   * Channels where activity should count but the bot can't see them (no View
+   * Channel), so it gets no messages or voice updates from them. Sorted like
+   * the channel list. Returns null if the bot's own membership isn't known.
+   */
+  async hiddenChannels(guildId, budget) {
+    const cfg = this.ensureConfig(guildId);
+    const { meta, members } = await this.loadGuild(guildId, budget);
+    const botMember = members.get(this.getState('botId'));
+    if (!botMember) return null;
+    const channels = await this.rest('GET', `/guilds/${guildId}/channels`, { budget });
+
+    // Refresh the channel → category map while we have it.
+    const parents = this.channelParents.get(guildId);
+    if (parents) for (const c of channels) parents.set(c.id, c.parent_id ?? null);
+
+    return channels
+      .filter((c) => ACTIVITY_CHANNEL_TYPES.has(c.type))
+      .filter((c) => channelCounts(cfg, [c.id, c.parent_id].filter(Boolean)))
+      .filter((c) => !canViewChannel(meta, botMember, c))
+      .sort((a, b) => a.position - b.position)
+      .map((c) => c.id);
+  }
+
+  /**
    * After a restart, fetch each server's roles and channels so pause roles and
    * the channel lists (threads and categories included) work in real time.
    */
@@ -958,6 +985,7 @@ export class AutoKickBot extends DurableObject {
       assessGuild: () => this.assessGuild(guildId, budget),
       assessMember: (userId) => this.assessMember(guildId, userId, budget),
       detectedPauseRoles: async () => detectedPauseRoleIds(await this.getMeta(guildId, budget)),
+      hiddenChannels: () => this.hiddenChannels(guildId, budget),
       log: (content) => this.log(guildId, content, budget),
       nextSweepAt: () => (this.getState('sweepQueue') ? Date.now() : this.getState('nextSweepAt', Date.now())),
       connected: () => this.ready,

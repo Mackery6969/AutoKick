@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
   botHasKickPermission,
   canKick,
+  canViewChannel,
+  PERM_VIEW_CHANNEL,
   editOriginalReply,
   guildMeta,
   memberRecord,
@@ -91,6 +93,40 @@ test('canKick needs Kick Members or Administrator', () => {
   const admin = { id: 'bot', roleIds: ['adminrole'] };
   assert.equal(canKick(meta, admin, { id: 'a', roleIds: ['member'] }), true);
   assert.equal(botHasKickPermission(meta, admin), true);
+});
+
+test('canViewChannel follows Discord permission overwrites', () => {
+  const VIEW = String(PERM_VIEW_CHANNEL);
+  const viewMeta = guildMeta({
+    id: 'G',
+    roles: [
+      { id: 'G', name: '@everyone', position: 0, permissions: VIEW },
+      { id: 'botrole', name: 'AutoKick', position: 5, permissions: String(PERM_KICK_MEMBERS) },
+      { id: 'adminrole', name: 'Admin', position: 6, permissions: String(PERM_ADMINISTRATOR) },
+    ],
+  });
+  const me = { id: 'bot', roleIds: ['botrole'] };
+  const ch = (...permission_overwrites) => ({ id: 'c', type: 0, permission_overwrites });
+  const ow = (id, type, { allow = '0', deny = '0' } = {}) => ({ id, type, allow, deny });
+
+  assert.equal(canViewChannel(viewMeta, me, ch()), true, 'public channel');
+  assert.equal(canViewChannel(viewMeta, me, ch(ow('G', 0, { deny: VIEW }))), false, 'private: @everyone denied');
+  assert.equal(
+    canViewChannel(viewMeta, me, ch(ow('G', 0, { deny: VIEW }), ow('botrole', 0, { allow: VIEW }))),
+    true,
+    'role allowed in a private channel',
+  );
+  assert.equal(
+    canViewChannel(viewMeta, me, ch(ow('G', 0, { deny: VIEW }), ow('botrole', 0, { allow: VIEW }), ow('bot', 1, { deny: VIEW }))),
+    false,
+    'member overwrite beats role overwrite',
+  );
+  assert.equal(
+    canViewChannel(viewMeta, { id: 'bot', roleIds: ['adminrole'] }, ch(ow('G', 0, { deny: VIEW }), ow('bot', 1, { deny: VIEW }))),
+    true,
+    'Administrator sees everything',
+  );
+  assert.equal(canViewChannel(viewMeta, me, ch(ow('other', 0, { deny: VIEW }))), true, "other roles' overwrites don't apply");
 });
 
 test('memberRecord reads API member objects', () => {
