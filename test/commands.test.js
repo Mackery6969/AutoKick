@@ -11,9 +11,10 @@ const baseConfig = () => ({
   armedAt: null,
   whitelist: { roles: [], users: [] },
   blacklist: { roles: [], users: [] },
+  pauseRoles: [],
 });
 
-function fakeApi({ cfg = baseConfig(), results = [], logFails = false } = {}) {
+function fakeApi({ cfg = baseConfig(), results = [], logFails = false, detected = [] } = {}) {
   const state = { cfg: structuredClone(cfg), logs: [] };
   return {
     state,
@@ -21,7 +22,8 @@ function fakeApi({ cfg = baseConfig(), results = [], logFails = false } = {}) {
     saveConfig: (c) => {
       state.cfg = structuredClone(c);
     },
-    assessGuild: async () => ({ cfg: structuredClone(state.cfg), results }),
+    assessGuild: async () => ({ cfg: structuredClone(state.cfg), results, detectedPauseRoles: detected }),
+    detectedPauseRoles: async () => detected,
     assessMember: async (id) => results.find((r) => r.member.id === id) ?? null,
     log: async (text) => {
       if (logFails) throw new Error('Missing Access');
@@ -140,6 +142,75 @@ test('preview lists members past the limit', async () => {
   const text = reply.embeds[0].description;
   assert.match(text, /2 members would be kicked/);
   assert.ok(text.indexOf('<@b>') < text.indexOf('<@a>'), 'longest inactive first');
+});
+
+const pauseCmd = (name, role) => ({
+  guild_id: 'G',
+  member: { user: { id: 'admin' } },
+  data: {
+    name: 'autokick',
+    options: [{ type: 2, name: 'pause', options: [{ type: 1, name, options: role ? [{ name: 'role', type: 8, value: role }] : [] }] }],
+  },
+});
+
+test('pause roles can be added, listed and removed; auto-detected ones are shown', async () => {
+  const api = fakeApi({ detected: ['MUTED'] });
+  const added = await runCommand(pauseCmd('add', 'BREAK'), api);
+  assert.deepEqual(api.state.cfg.pauseRoles, ['BREAK']);
+  assert.match(added.content, /won't lose time/);
+
+  const list = await runCommand(pauseCmd('list'), api);
+  assert.match(list.embeds[0].description, /<@&BREAK>, <@&MUTED> \(auto\)/);
+
+  const auto = await runCommand(pauseCmd('remove', 'MUTED'), api);
+  assert.match(auto.content, /picked up automatically/);
+
+  await runCommand(pauseCmd('remove', 'BREAK'), api);
+  assert.deepEqual(api.state.cfg.pauseRoles, []);
+
+  const everyone = await runCommand(pauseCmd('add', 'G'), api);
+  assert.match(everyone.content, /@everyone/);
+});
+
+test('status counts muted members and shows pause roles', async () => {
+  const api = fakeApi({ results: [result('a', 'paused', { reason: 'timeout' }), result('b', 'kick')], detected: ['MUTED'] });
+  const fields = Object.fromEntries((await runCommand(sub('status'), api)).embeds[0].fields.map((f) => [f.name, f.value]));
+  assert.equal(fields['Muted right now (clock paused)'], '1');
+  assert.equal(fields['Past the limit'], '1');
+  assert.equal(fields['Pause roles (plus anyone timed out)'], '<@&MUTED> (auto)');
+});
+
+test('check explains a paused clock', async () => {
+  const api = fakeApi({
+    results: [result('a', 'paused', { reason: 'timeout', remainingMs: 5 * DAY_MS, pausedMs: 3 * DAY_MS, inactiveMs: 25 * DAY_MS })],
+  });
+  const reply = await runCommand(sub('check', [{ name: 'member', type: 6, value: 'a' }]), api);
+  assert.match(reply.content, /Clock paused: they're timed out\. 5 days left/);
+  assert.match(reply.content, /Muted time not counted: 3 days/);
+});
+
+test('/activity shows last activity for you or another member', async () => {
+  const seen = Date.now() - 3 * 3600_000;
+  const api = fakeApi({
+    results: [
+      result('me', 'keep', { recorded: true, lastActive: seen }),
+      result('other', 'protected', { recorded: true, lastActive: seen, reason: 'whitelisted member' }),
+      result('quiet', 'keep', { recorded: false, lastActive: baseConfig().trackingSince }),
+    ],
+  });
+  const cmd = (member) => ({
+    guild_id: 'G',
+    member: { user: { id: 'me' } },
+    data: { name: 'activity', options: member ? [{ name: 'member', type: 6, value: member }] : [] },
+  });
+  const unix = Math.floor(seen / 1000);
+
+  assert.equal((await runCommand(cmd(), api)).content, `You were last active <t:${unix}:R> (<t:${unix}:f>).`);
+  const other = (await runCommand(cmd('other'), api)).content;
+  assert.match(other, /\*\*user\\_other\*\* was last active/);
+  assert.doesNotMatch(other, /whitelist|protected/i, 'no moderation details for members');
+  assert.match((await runCommand(cmd('quiet'), api)).content, /hasn't sent a message or been in voice since I started tracking/);
+  assert.match((await runCommand(cmd('ghost'), api)).content, /isn't in this server/);
 });
 
 test('check explains protection', async () => {

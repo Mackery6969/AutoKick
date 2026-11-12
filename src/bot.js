@@ -8,17 +8,19 @@
 // happen in alarm() or handleCommand(), each with its own request Budget.
 
 import { DurableObject } from 'cloudflare:workers';
-import { assess, DAY_MS, escapeMarkdown, formatDuration } from './policy.js';
+import { assess, DAY_MS, escapeMarkdown, formatDuration, pauseChanges } from './policy.js';
 import {
   APP_FLAGS_MEMBERS_INTENT,
   Budget,
   BudgetExceeded,
   canKick,
+  detectedPauseRoleIds,
   discordRest,
   editOriginalReply,
   guildMeta,
   INTENTS,
   memberRecord,
+  pauseRoleIds,
 } from './discord.js';
 import { COMMANDS, runCommand } from './commands.js';
 
@@ -74,6 +76,7 @@ function defaultConfig(now) {
     armedAt: null,
     whitelist: { roles: [], users: [] },
     blacklist: { roles: [], users: [] },
+    pauseRoles: [], // members with these roles don't lose time (plus auto-detected "Muted" roles)
   };
 }
 
@@ -89,6 +92,11 @@ export class AutoKickBot extends DurableObject {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS voice (
       guild_id TEXT NOT NULL, user_id TEXT NOT NULL, channel_id TEXT NOT NULL,
       PRIMARY KEY (guild_id, user_id))`);
+    // Periods when a member was muted (kind 'timeout' or 'role'); ended_at is NULL while ongoing.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS pauses (
+      guild_id TEXT NOT NULL, user_id TEXT NOT NULL, kind TEXT NOT NULL,
+      started_at INTEGER NOT NULL, ended_at INTEGER)`);
+    this.sql.exec('CREATE INDEX IF NOT EXISTS pauses_member ON pauses (guild_id, user_id)');
 
     this.ws = null;
     this.ready = false;
@@ -100,6 +108,7 @@ export class AutoKickBot extends DurableObject {
     this.nextConnectAt = 0;
     this.tokenId = null;
     this.lastWrite = new Map(); // "guild:user" -> last stored activity time
+    this.recent = new Map(); // guildId -> Map<userId, exact last activity time> (memory only)
     this.guildCache = new Map(); // guildId -> guildMeta (roles, owner, AFK channel)
     this.memberCache = new Map(); // guildId -> { fetchedAt, members: Map<userId, record> }
     this.kickFailures = new Map(); // "guild:user" -> time of last failed kick
@@ -158,6 +167,11 @@ export class AutoKickBot extends DurableObject {
   }
 
   touch(guildId, userId, ts = Date.now()) {
+    // Exact time in memory; storage is only updated hourly to save writes.
+    if (!this.recent.has(guildId)) this.recent.set(guildId, new Map());
+    const recent = this.recent.get(guildId);
+    if (ts > (recent.get(userId) ?? 0)) recent.set(userId, ts);
+
     const key = `${guildId}:${userId}`;
     if (ts - (this.lastWrite.get(key) ?? 0) < TOUCH_THROTTLE_MS) return;
     this.sql.exec(
@@ -183,13 +197,57 @@ export class AutoKickBot extends DurableObject {
 
   activityMap(guildId) {
     const rows = this.sql.exec('SELECT user_id, last_active FROM activity WHERE guild_id = ?', guildId).toArray();
-    return Object.fromEntries(rows.map((r) => [r.user_id, r.last_active]));
+    const map = Object.fromEntries(rows.map((r) => [r.user_id, r.last_active]));
+    for (const [userId, ts] of this.recent.get(guildId) ?? []) {
+      if (ts > (map[userId] ?? 0)) map[userId] = ts;
+    }
+    return map;
+  }
+
+  /** Muted periods for a server (or one member), grouped by member. */
+  pauseRows(guildId, userId = null) {
+    const query = 'SELECT rowid AS id, user_id, kind, started_at, ended_at FROM pauses WHERE guild_id = ?';
+    const rows = userId
+      ? this.sql.exec(`${query} AND user_id = ?`, guildId, userId).toArray()
+      : this.sql.exec(query, guildId).toArray();
+    const byUser = new Map();
+    for (const row of rows) {
+      if (!byUser.has(row.user_id)) byUser.set(row.user_id, []);
+      byUser.get(row.user_id).push(row);
+    }
+    return byUser;
+  }
+
+  /**
+   * Record when a member becomes muted (timed out, or given a pause role) and
+   * when that stops. `pauseRoles` is null when the server's roles aren't known
+   * yet; then only timeouts are synced. Returns true if anything was written.
+   */
+  syncPause(guildId, member, rows, pauseRoles, now = Date.now()) {
+    const ops = pauseChanges(rows, member, pauseRoles, now);
+    for (const { insert, update } of ops) {
+      if (insert) {
+        this.sql.exec(
+          'INSERT INTO pauses (guild_id, user_id, kind, started_at, ended_at) VALUES (?, ?, ?, ?, ?)',
+          guildId,
+          member.id,
+          insert.kind,
+          insert.start,
+          insert.end,
+        );
+      } else {
+        this.sql.exec('UPDATE pauses SET ended_at = ? WHERE rowid = ?', update.end, update.id);
+      }
+    }
+    return ops.length > 0;
   }
 
   forgetMember(guildId, userId) {
     this.sql.exec('DELETE FROM activity WHERE guild_id = ? AND user_id = ?', guildId, userId);
     this.sql.exec('DELETE FROM voice WHERE guild_id = ? AND user_id = ?', guildId, userId);
+    this.sql.exec('DELETE FROM pauses WHERE guild_id = ? AND user_id = ?', guildId, userId);
     this.lastWrite.delete(`${guildId}:${userId}`);
+    this.recent.get(guildId)?.delete(userId);
     this.memberCache.get(guildId)?.members.delete(userId);
   }
 
@@ -197,6 +255,8 @@ export class AutoKickBot extends DurableObject {
     this.sql.exec('DELETE FROM guilds WHERE id = ?', guildId);
     this.sql.exec('DELETE FROM activity WHERE guild_id = ?', guildId);
     this.sql.exec('DELETE FROM voice WHERE guild_id = ?', guildId);
+    this.sql.exec('DELETE FROM pauses WHERE guild_id = ?', guildId);
+    this.recent.delete(guildId);
     this.guildCache.delete(guildId);
     this.memberCache.delete(guildId);
   }
@@ -410,14 +470,30 @@ export class AutoKickBot extends DurableObject {
         if (!d.unavailable) this.forgetGuild(d.id); // the bot was removed from the server
         return;
       case 'GUILD_ROLE_CREATE':
-      case 'GUILD_ROLE_UPDATE':
+      case 'GUILD_ROLE_UPDATE': {
+        const { role } = d;
+        this.guildCache.get(d.guild_id)?.roles.set(role.id, {
+          name: role.name,
+          position: role.position,
+          permissions: BigInt(role.permissions),
+        });
+        return;
+      }
       case 'GUILD_ROLE_DELETE':
-        this.guildCache.delete(d.guild_id); // re-fetched the next time it's needed
+        this.guildCache.get(d.guild_id)?.roles.delete(d.role_id);
         return;
       case 'GUILD_MEMBER_ADD':
-      case 'GUILD_MEMBER_UPDATE':
-        this.memberCache.get(d.guild_id)?.members.set(d.user.id, memberRecord(d));
+      case 'GUILD_MEMBER_UPDATE': {
+        const record = memberRecord(d);
+        this.memberCache.get(d.guild_id)?.members.set(record.id, record);
+        const cfg = this.getConfig(d.guild_id);
+        if (cfg) {
+          const meta = this.guildCache.get(d.guild_id);
+          const rows = this.pauseRows(d.guild_id, record.id).get(record.id) ?? [];
+          this.syncPause(d.guild_id, record, rows, meta ? pauseRoleIds(cfg, meta) : null);
+        }
         return;
+      }
       case 'GUILD_MEMBER_REMOVE':
         return this.forgetMember(d.guild_id, d.user.id);
       case 'MESSAGE_CREATE':
@@ -522,6 +598,7 @@ export class AutoKickBot extends DurableObject {
         if (session && this.seq != null) this.setState('session', { ...session, seq: this.seq });
         this.touchVoice();
         await this.syncCommands(budget);
+        await this.loadMissingGuildMeta(budget);
         await this.runSweeps(budget);
       }
     } catch (err) {
@@ -552,12 +629,17 @@ export class AutoKickBot extends DurableObject {
 
   // ---------------------------------------------------------------- assessing & kicking
 
-  async loadGuild(guildId, budget) {
+  async getMeta(guildId, budget) {
     let meta = this.guildCache.get(guildId);
     if (!meta) {
       meta = guildMeta(await this.rest('GET', `/guilds/${guildId}`, { budget }));
       this.guildCache.set(guildId, meta);
     }
+    return meta;
+  }
+
+  async loadGuild(guildId, budget) {
+    const meta = await this.getMeta(guildId, budget);
     let cache = this.memberCache.get(guildId);
     if (!cache || Date.now() - cache.fetchedAt > MEMBER_CACHE_MS) {
       const members = new Map();
@@ -574,23 +656,44 @@ export class AutoKickBot extends DurableObject {
     return { meta, members: cache.members };
   }
 
-  assessWith(cfg, meta, botMember, member, ctx) {
-    const snapshot = { ...member, isOwner: member.id === meta.ownerId, kickable: canKick(meta, botMember, member) };
+  assessWith(cfg, meta, botMember, member, pauseRows, ctx) {
+    const { now } = ctx;
+    const current = pauseRows.find((r) => r.started_at <= now && (r.ended_at === null || r.ended_at > now));
+    const snapshot = {
+      ...member,
+      isOwner: member.id === meta.ownerId,
+      kickable: canKick(meta, botMember, member),
+      pauses: pauseRows.map((r) => [r.started_at, r.ended_at ?? now]),
+      pausedBy: current?.kind ?? null,
+    };
     return assess(snapshot, cfg, ctx);
+  }
+
+  /** Bring the muted-period records up to date for these members (catches anything missed while offline). */
+  syncPauses(guildId, cfg, meta, members, now) {
+    const roles = pauseRoleIds(cfg, meta);
+    const before = this.pauseRows(guildId);
+    let changed = false;
+    for (const member of members) {
+      if (this.syncPause(guildId, member, before.get(member.id) ?? [], roles, now)) changed = true;
+    }
+    return changed ? this.pauseRows(guildId) : before;
   }
 
   async assessGuild(guildId, budget) {
     const cfg = this.ensureConfig(guildId);
     const { meta, members } = await this.loadGuild(guildId, budget);
     this.touchVoice(guildId);
+    const now = Date.now();
+    const pauses = this.syncPauses(guildId, cfg, meta, members.values(), now);
     const botMember = members.get(this.getState('botId'));
     const full = { ...cfg, activity: this.activityMap(guildId) };
-    const ctx = { now: Date.now(), downtime: this.getState('downtime', []) };
+    const ctx = { now, downtime: this.getState('downtime', []) };
     const results = [...members.values()].map((member) => ({
       member,
-      result: this.assessWith(full, meta, botMember, member, ctx),
+      result: this.assessWith(full, meta, botMember, member, pauses.get(member.id) ?? [], ctx),
     }));
-    return { cfg, meta, botMember, results };
+    return { cfg, meta, botMember, results, detectedPauseRoles: detectedPauseRoleIds(meta) };
   }
 
   async assessMember(guildId, userId, budget) {
@@ -599,9 +702,25 @@ export class AutoKickBot extends DurableObject {
     const member = members.get(userId);
     if (!member) return null;
     this.touchVoice(guildId);
+    const now = Date.now();
+    const pauses = this.syncPauses(guildId, cfg, meta, [member], now);
     const full = { ...cfg, activity: this.activityMap(guildId) };
-    const ctx = { now: Date.now(), downtime: this.getState('downtime', []) };
-    return { member, result: this.assessWith(full, meta, members.get(this.getState('botId')), member, ctx) };
+    const ctx = { now, downtime: this.getState('downtime', []) };
+    const botMember = members.get(this.getState('botId'));
+    return { member, result: this.assessWith(full, meta, botMember, member, pauses.get(userId) ?? [], ctx) };
+  }
+
+  /** After a restart, fetch each server's roles so pause roles are recognised in real time. */
+  async loadMissingGuildMeta(budget) {
+    for (const { id } of this.sql.exec('SELECT id FROM guilds').toArray()) {
+      if (this.guildCache.has(id) || budget.remaining < 20) continue;
+      try {
+        await this.getMeta(id, budget);
+      } catch (err) {
+        if (err instanceof BudgetExceeded) throw err;
+        console.warn(`Could not load server ${id}: ${err.message}`);
+      }
+    }
   }
 
   async runSweeps(budget) {
@@ -610,6 +729,7 @@ export class AutoKickBot extends DurableObject {
       const now = Date.now();
       if (now < this.getState('nextSweepAt', 0)) return;
       this.setState('nextSweepAt', now + SWEEP_INTERVAL_MS);
+      this.sql.exec('DELETE FROM pauses WHERE ended_at IS NOT NULL AND ended_at < ?', now - DOWNTIME_KEEP_MS);
       queue = this.sql
         .exec('SELECT id, config FROM guilds')
         .toArray()
@@ -753,6 +873,7 @@ export class AutoKickBot extends DurableObject {
       saveConfig: (cfg) => this.saveConfig(guildId, cfg),
       assessGuild: () => this.assessGuild(guildId, budget),
       assessMember: (userId) => this.assessMember(guildId, userId, budget),
+      detectedPauseRoles: async () => detectedPauseRoleIds(await this.getMeta(guildId, budget)),
       log: (content) => this.log(guildId, content, budget),
       nextSweepAt: () => (this.getState('sweepQueue') ? Date.now() : this.getState('nextSweepAt', Date.now())),
       connected: () => this.ready,

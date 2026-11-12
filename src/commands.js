@@ -9,6 +9,7 @@ const GROUP = 2;
 const INTEGER = 4;
 const USER = 6;
 const CHANNEL = 7;
+const ROLE = 8;
 const MENTIONABLE = 9;
 const MANAGE_GUILD = String(1 << 5);
 const COLOR = 0x5865f2;
@@ -65,7 +66,34 @@ export const COMMANDS = [
       },
       listGroup('whitelist', 'Roles and members that are never auto-kicked'),
       listGroup('blacklist', 'Roles and members that can be kicked even with a whitelisted role'),
+      {
+        type: GROUP,
+        name: 'pause',
+        description: "Roles that pause a member's clock, like a Muted role (timeouts always pause)",
+        options: [
+          {
+            type: SUB,
+            name: 'add',
+            description: 'Add a pause role',
+            options: [{ type: ROLE, name: 'role', description: 'Role that pauses the clock', required: true }],
+          },
+          {
+            type: SUB,
+            name: 'remove',
+            description: 'Remove a pause role',
+            options: [{ type: ROLE, name: 'role', description: 'Role to remove', required: true }],
+          },
+          { type: SUB, name: 'list', description: 'Show pause roles' },
+        ],
+      },
     ],
+  },
+  {
+    name: 'activity',
+    description: 'See when you or another member was last active',
+    contexts: [0],
+    integration_types: [0],
+    options: [{ type: USER, name: 'member', description: 'Member to look up (default: you)' }],
   },
   {
     name: 'ping',
@@ -98,6 +126,14 @@ function formatList(list) {
     text += (text ? ', ' : '') + item;
   }
   return text;
+}
+
+function formatPauseRoles(cfg, detected = []) {
+  const items = [
+    ...cfg.pauseRoles.map((id) => `<@&${id}>`),
+    ...detected.filter((id) => !cfg.pauseRoles.includes(id)).map((id) => `<@&${id}> (auto)`),
+  ];
+  return items.length ? items.join(', ').slice(0, 1000) : 'None';
 }
 
 const BLOCKED_HELP =
@@ -162,8 +198,9 @@ const handlers = {
   },
 
   async status({ api }) {
-    const { cfg, results } = await api.assessGuild();
+    const { cfg, results, detectedPauseRoles } = await api.assessGuild();
     const { due, blocked } = tally(results);
+    const muted = results.filter((r) => r.result.action === 'paused').length;
     const now = Date.now();
     let state = 'Off';
     if (cfg.enabled) state = cfg.armedAt > now ? `On (kicks start ${ts(cfg.armedAt)})` : 'On';
@@ -182,10 +219,16 @@ const handlers = {
           value: `${due.length}${blocked.length ? ` (+${blocked.length} I can't kick)` : ''}`,
           inline: true,
         },
+        { name: 'Muted right now (clock paused)', value: String(muted), inline: true },
         { name: 'Whitelist (never kicked)', value: formatList(cfg.whitelist) },
         { name: 'Blacklist (kickable even with a whitelisted role)', value: formatList(cfg.blacklist) },
+        { name: 'Pause roles (plus anyone timed out)', value: formatPauseRoles(cfg, detectedPauseRoles) },
       ],
-      footer: { text: 'Activity = sending messages or being in a voice channel (the AFK channel does not count).' },
+      footer: {
+        text:
+          'Activity = sending messages or being in a voice channel (not the AFK channel). ' +
+          "Time spent timed out or with a pause role doesn't count.",
+      },
     };
     const content = api.connected() ? undefined : NOT_CONNECTED;
     return { content, embeds: [embed] };
@@ -242,8 +285,15 @@ const handlers = {
       lines.push(`Last activity: none recorded. Counting from ${ts(result.lastActive, 'D')} (${from}).`);
     }
     lines.push(`Counted inactivity: ${formatDuration(result.inactiveMs)} (limit ${plural(cfg.days, 'day')})`);
+    if (result.pausedMs >= 60_000) lines.push(`Muted time not counted: ${formatDuration(result.pausedMs)}`);
 
     switch (result.action) {
+      case 'paused':
+        lines.push(
+          `⏸️ Clock paused: ${result.reason === 'timeout' ? "they're timed out" : 'they have a pause role'}. ` +
+            `${formatDuration(result.remainingMs)} left once that ends.`,
+        );
+        break;
       case 'kick':
         lines.push(
           cfg.enabled
@@ -367,6 +417,52 @@ async function editList({ api, opts, interaction, userId }, listName, action) {
   return { content: `✅ Removed ${mention} from the ${listName}.` };
 }
 
+async function editPauseRoles({ api, opts, interaction, userId }, action) {
+  const cfg = api.getConfig();
+  const detected = await api.detectedPauseRoles();
+  if (action === 'list') {
+    return {
+      embeds: [
+        {
+          title: 'Pause roles',
+          color: COLOR,
+          description:
+            `${formatPauseRoles(cfg, detected)}\n\n` +
+            "While a member has one of these roles, or is timed out, their inactivity clock is stopped and they can't be kicked. " +
+            'Roles named like "Muted" are picked up automatically.',
+        },
+      ],
+    };
+  }
+
+  const id = opts.role;
+  const mention = `<@&${id}>`;
+  if (id === interaction.guild_id) return { content: "@everyone can't be a pause role. Use `/autokick disable` instead." };
+
+  if (action === 'add') {
+    if (cfg.pauseRoles.includes(id)) return { content: `${mention} is already a pause role.` };
+    cfg.pauseRoles.push(id);
+    api.saveConfig(cfg);
+    await api.log(`⚙️ <@${userId}> added ${mention} as a pause role.`).catch(() => {});
+    return {
+      content: `✅ Members with ${mention} won't lose time while they have it, and can't be auto-kicked until it's removed.`,
+    };
+  }
+
+  if (!cfg.pauseRoles.includes(id)) {
+    return {
+      content: detected.includes(id)
+        ? `${mention} was picked up automatically because of its name, so it can't be removed. Rename the role if it shouldn't pause anyone.`
+        : `${mention} isn't a pause role.`,
+    };
+  }
+  cfg.pauseRoles = cfg.pauseRoles.filter((x) => x !== id);
+  api.saveConfig(cfg);
+  await api.log(`⚙️ <@${userId}> removed ${mention} as a pause role.`).catch(() => {});
+  const still = detected.includes(id) ? ' It still counts automatically because of its name.' : '';
+  return { content: `✅ ${mention} is no longer a pause role.${still}` };
+}
+
 /** Discord IDs encode their creation time. */
 const snowflakeTime = (id) => Number((BigInt(id) >> 22n) + 1420070400000n);
 
@@ -384,8 +480,29 @@ function ping(interaction, api) {
   return { content: lines.join('\n') };
 }
 
+/** /activity: anyone can see when a member was last active (nothing about lists or kicks). */
+async function activity(interaction, api) {
+  const self = interaction.member?.user?.id;
+  const userId = interaction.data.options?.find((o) => o.name === 'member')?.value ?? self;
+  const found = await api.assessMember(userId);
+  if (!found) return { content: `<@${userId}> isn't in this server.` };
+  const { member, result } = found;
+  if (member.bot) return { content: "Bots aren't tracked." };
+
+  const who = userId === self ? 'You were' : `**${escapeMarkdown(member.username)}** was`;
+  if (result.recorded) {
+    return { content: `${who} last active ${ts(result.lastActive)} (${ts(result.lastActive, 'f')}).` };
+  }
+  const since = result.lastActive === api.getConfig().trackingSince ? 'I started tracking' : 'joining';
+  const subject = userId === self ? "You haven't" : `**${escapeMarkdown(member.username)}** hasn't`;
+  return {
+    content: `${subject} sent a message or been in voice since ${since} (${ts(result.lastActive, 'D')}).`,
+  };
+}
+
 export async function runCommand(interaction, api) {
   if (interaction.data?.name === 'ping') return ping(interaction, api);
+  if (interaction.data?.name === 'activity') return activity(interaction, api);
   const top = interaction.data?.options?.[0];
   if (!top) return { content: 'Unknown command.' };
   const group = top.type === GROUP ? top.name : null;
@@ -396,6 +513,7 @@ export async function runCommand(interaction, api) {
     userId: interaction.member?.user?.id,
     opts: Object.fromEntries((sub?.options ?? []).map((o) => [o.name, o.value])),
   };
+  if (group === 'pause') return editPauseRoles(ctx, sub.name);
   if (group) return editList(ctx, group, sub.name);
   const handler = handlers[sub.name];
   return handler ? handler(ctx) : { content: 'Unknown command.' };

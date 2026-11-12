@@ -6,6 +6,7 @@ import {
   editOriginalReply,
   guildMeta,
   memberRecord,
+  pauseRoleIds,
   PERM_ADMINISTRATOR,
   PERM_KICK_MEMBERS,
 } from '../src/discord.js';
@@ -104,5 +105,29 @@ test('memberRecord reads API member objects', () => {
     bot: false,
     roleIds: ['member'],
     joinedTimestamp: Date.parse('2026-01-02T03:04:05.000Z'),
+    timeoutUntil: null,
   });
+  const timedOut = memberRecord({
+    user: { id: '2', username: 'kim' },
+    roles: [],
+    joined_at: '2026-01-02T03:04:05.000Z',
+    communication_disabled_until: '2026-12-01T00:00:00.000Z',
+  });
+  assert.equal(timedOut.timeoutUntil, Date.parse('2026-12-01T00:00:00.000Z'));
+});
+
+test('pause roles: configured ones plus roles named like "Muted"', () => {
+  const m = guildMeta({
+    id: 'G',
+    roles: [
+      { id: 'G', name: '@everyone', position: 0, permissions: '0' },
+      { id: 'r1', name: 'Muted', position: 1, permissions: '0' },
+      { id: 'r2', name: '🔇 VC Mute', position: 1, permissions: '0' },
+      { id: 'r3', name: 'Unmuted', position: 1, permissions: '0' },
+      { id: 'r4', name: 'Mutedragon fan club', position: 1, permissions: '0' },
+      { id: 'r5', name: 'On Break', position: 1, permissions: '0' },
+    ],
+  });
+  assert.deepEqual([...pauseRoleIds({ pauseRoles: ['r5'] }, m)].sort(), ['r1', 'r2', 'r5']);
+  assert.deepEqual([...pauseRoleIds({ pauseRoles: [] }, undefined)], []);
 });

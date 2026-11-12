@@ -101,7 +101,7 @@ export function guildMeta(guild) {
     ownerId: guild.owner_id,
     afkChannelId: guild.afk_channel_id ?? null,
     roles: new Map(
-      (guild.roles ?? []).map((r) => [r.id, { position: r.position, permissions: BigInt(r.permissions) }]),
+      (guild.roles ?? []).map((r) => [r.id, { name: r.name, position: r.position, permissions: BigInt(r.permissions) }]),
     ),
   };
 }
@@ -114,7 +114,25 @@ export function memberRecord(m) {
     bot: Boolean(m.user.bot),
     roleIds: m.roles ?? [],
     joinedTimestamp: m.joined_at ? Date.parse(m.joined_at) : null,
+    timeoutUntil: m.communication_disabled_until ? Date.parse(m.communication_disabled_until) : null,
   };
+}
+
+// Roles named like "Muted" / "Mute" / "🔇 Muted" count as pause roles automatically.
+const MUTED_ROLE_NAME = /\bmuted?\b/i;
+
+/** Pause roles for a server: the ones configured with /autokick pause, plus auto-detected "Muted" roles. */
+export function pauseRoleIds(cfg, meta) {
+  const ids = new Set(cfg?.pauseRoles ?? []);
+  for (const [id, role] of meta?.roles ?? []) {
+    if (role.name && MUTED_ROLE_NAME.test(role.name)) ids.add(id);
+  }
+  return ids;
+}
+
+/** Auto-detected pause roles only (for display). */
+export function detectedPauseRoleIds(meta) {
+  return [...(meta?.roles ?? [])].filter(([, role]) => role.name && MUTED_ROLE_NAME.test(role.name)).map(([id]) => id);
 }
 
 function highestPosition(meta, roleIds) {

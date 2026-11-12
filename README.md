@@ -7,6 +7,12 @@ A Discord bot that kicks members who haven't **sent a message** or **been in a v
 - Sending a message anywhere in the server: channels, threads, forum posts, replies.
 - Being in a voice channel: joining, leaving, switching, or just sitting in it. The server's AFK channel doesn't count.
 
+## Muted members
+
+It isn't fair to count time against someone who wasn't allowed to talk. While a member is **timed out**, or has a **pause role**, their inactivity clock stops. It picks up where it left off once the mute ends; it doesn't restart from zero. Nobody is kicked while they're muted.
+
+Pause roles are any role named like "Muted" or "Mute" (picked up automatically), plus any roles you add with `/autokick pause add`, such as an "On Break" role.
+
 ## Who is never kicked
 
 - Bots and the server owner.
@@ -36,6 +42,8 @@ All commands are under `/autokick`. By default only members with **Manage Server
 | `/autokick logchannel [channel:]` | Post kicks and setting changes in a channel (leave empty to turn off) |
 | `/autokick whitelist add/remove/list` | Roles or members that are never kicked |
 | `/autokick blacklist add/remove/list` | Roles or members that can be kicked even if they have a whitelisted role |
+| `/autokick pause add/remove/list` | Roles that pause a member's clock while they have them (timeouts always do) |
+| `/activity [member:]` | When you (or another member) last sent a message or was in voice (anyone can use it) |
 | `/ping` | Check the bot is online and replying (anyone can use it) |
 
 ### Whitelist and blacklist
