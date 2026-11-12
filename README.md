@@ -58,88 +58,28 @@ Everyone is checked for inactivity unless the whitelist protects them. When rule
 
 Example: whitelist `@Members`, blacklist `@Trial`. Inactive members with `@Members` are safe, unless they also have `@Trial`.
 
----
-
-## Setup
-
-You need a Discord account, a free Cloudflare account, and [Node.js](https://nodejs.org) 20 or newer.
-
-### 1. Create the Discord application
-
-1. Go to <https://discord.com/developers/applications> → **New Application**.
-2. On **General Information**, copy the **Application ID** and **Public Key**.
-3. On **Bot**:
-   - Click **Reset Token** and copy the token. It's only shown once; treat it like a password.
-   - Under **Privileged Gateway Intents**, turn on **Server Members Intent**. Message Content Intent is *not* needed.
-
-### 2. Deploy to Cloudflare
-
-In this folder:
-
-```bash
-npm install
-```
-
-```bash
-npx wrangler login
-```
-
-```bash
-npx wrangler deploy
-```
-
-The deploy prints your Worker's address, like `https://autokick.<your-name>.workers.dev`. Then add the two secrets; each command asks you to paste the value:
-
-```bash
-npx wrangler secret put DISCORD_TOKEN
-```
-
-```bash
-npx wrangler secret put DISCORD_PUBLIC_KEY
-```
-
-### 3. Point Discord at the Worker
-
-Back in the Developer Portal, **General Information** → **Interactions Endpoint URL**, enter:
-
-```
-https://autokick.<your-name>.workers.dev/interactions
-```
-
-Click **Save**. Discord sends a test request, and it only saves if the Worker answers correctly.
-
-### 4. Invite the bot
+## Invite
 
 Open this link, with your Application ID filled in, and pick your server:
 
 ```
-https://discord.com/oauth2/authorize?client_id=YOUR_APPLICATION_ID&scope=bot+applications.commands&permissions=19458
+https://discord.com/oauth2/authorize?client_id=1570482569844097064
 ```
-
-This grants Kick Members, View Channels, Send Messages and Embed Links.
 
 Then in **Server Settings → Roles**, drag the bot's role **above** the roles of everyone it should be able to kick.
 
-### 5. Check it's running
+## Check if the bot is running
 
-Open `https://autokick.<your-name>.workers.dev/`. You should see `"connected": true`. If `problem` isn't `null`, it tells you what to fix. The bot starts within a few minutes of deploying; opening this page also wakes it.
+Open `https://autokick.mackery.com/`. You should see `"connected": true`. If `problem` isn't `null`, it tells you what to fix. The bot starts within a few minutes of deploying; opening this page also wakes it.
 
 The `/autokick` commands appear about a minute after the bot first connects. If you don't see them, reload Discord (Ctrl+R).
 
-### 6. Try it
+## Getting started
 
 1. `/autokick status`
 2. `/autokick logchannel channel:#mod-log` (optional)
 3. `/autokick preview`
 4. `/autokick enable`
-
----
-
-## Putting it on GitHub
-
-- `.gitignore` already keeps secrets and build files out. **Never commit your bot token.** It lives only in Cloudflare (`wrangler secret put`).
-- **Auto-deploy on push:** in the Cloudflare dashboard, open **Workers & Pages → autokick → Settings → Build** and connect your GitHub repository. Every push to your main branch redeploys. Secrets stay in Cloudflare.
-- A deploy briefly restarts the bot. It reconnects on its own and Discord replays anything it missed.
 
 ## Cost and limits
 
