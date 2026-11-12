@@ -29,6 +29,7 @@ function fakeApi({ cfg = baseConfig(), results = [], logFails = false } = {}) {
     },
     nextSweepAt: () => Date.now() + 30 * 60_000,
     connected: () => true,
+    latency: () => 42,
     enableGraceMs: 60 * 60_000,
   };
 }
@@ -62,6 +63,18 @@ test('command definitions stay within Discord limits', () => {
     (opt.options ?? []).forEach(walk);
   };
   COMMANDS.forEach(walk);
+});
+
+test('ping replies with timing and connection state', async () => {
+  // Snowflake for "now": (ms since Discord epoch) << 22
+  const id = String((BigInt(Date.now() - 250) - 1420070400000n) << 22n);
+  const reply = await runCommand({ id, guild_id: 'G', data: { name: 'ping' } }, fakeApi());
+  assert.match(reply.content, /Pong!/);
+  assert.match(reply.content, /reached me in \d+ ms/);
+  assert.match(reply.content, /heartbeat 42 ms/);
+
+  const offline = { ...fakeApi(), connected: () => false, latency: () => null };
+  assert.match((await runCommand({ id, guild_id: 'G', data: { name: 'ping' } }, offline)).content, /Not connected/);
 });
 
 test('enable turns it on with a grace period and reports who is due', async () => {

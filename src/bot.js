@@ -15,6 +15,7 @@ import {
   BudgetExceeded,
   canKick,
   discordRest,
+  editOriginalReply,
   guildMeta,
   INTENTS,
   memberRecord,
@@ -37,6 +38,9 @@ const KICK_RETRY_MS = 6 * 60 * 60_000;
 const REQUEST_BUDGET = 44; // leaves headroom under the free plan's 50
 const DEFAULT_GATEWAY = 'wss://gateway.discord.gg';
 const COUNTED_MESSAGE_TYPES = new Set([0, 18, 19]); // normal message, thread created, reply
+
+// Shown under the bot's name in Discord: "Watching Activity..." (activity type 3 = Watching).
+const PRESENCE = { since: null, activities: [{ name: 'Activity...', type: 3 }], status: 'online', afk: false };
 
 const TOKEN_PROBLEM = 'Discord rejected the bot token. Set the DISCORD_TOKEN secret again.';
 const INTENT_PROBLEM =
@@ -297,6 +301,7 @@ export class AutoKickBot extends DurableObject {
         break;
       case 11: // heartbeat ack
         this.hbAcked = true;
+        if (this.hbSentAt) this.latency = Date.now() - this.hbSentAt;
         break;
     }
   }
@@ -319,6 +324,7 @@ export class AutoKickBot extends DurableObject {
           intents: INTENTS,
           properties: { os: 'cloudflare', browser: 'autokick', device: 'autokick' },
           large_threshold: 50,
+          presence: PRESENCE,
         },
       });
     }
@@ -331,6 +337,7 @@ export class AutoKickBot extends DurableObject {
       if (ws !== this.ws) return this.stopHeartbeat();
       if (!this.hbAcked) return this.dropConnection(ws, 'heartbeat not acknowledged', { resumable: true });
       this.hbAcked = false;
+      this.hbSentAt = Date.now();
       this.send({ op: 1, d: this.seq });
     };
     this.hbTimeout = setTimeout(() => {
@@ -390,6 +397,8 @@ export class AutoKickBot extends DurableObject {
       case 'READY':
         return this.onReady(d);
       case 'RESUMED':
+        // A resumed session may predate the current presence; set it again.
+        this.send({ op: 3, d: PRESENCE });
         return this.markWatching(false);
       case 'GUILD_CREATE':
         return this.onGuildCreate(d);
@@ -730,10 +739,7 @@ export class AutoKickBot extends DurableObject {
       };
     }
     try {
-      await this.rest('PATCH', `/webhooks/${interaction.application_id}/${interaction.token}/messages/@original`, {
-        body: { ...reply, allowed_mentions: { parse: [] } },
-        auth: false,
-      });
+      await editOriginalReply(interaction, reply);
     } catch (err) {
       console.error('Could not send command reply:', err.message);
     }
@@ -750,6 +756,7 @@ export class AutoKickBot extends DurableObject {
       log: (content) => this.log(guildId, content, budget),
       nextSweepAt: () => (this.getState('sweepQueue') ? Date.now() : this.getState('nextSweepAt', Date.now())),
       connected: () => this.ready,
+      latency: () => (this.ready ? (this.latency ?? null) : null),
       enableGraceMs: ENABLE_GRACE_MS,
     };
   }

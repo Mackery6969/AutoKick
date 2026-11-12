@@ -1,6 +1,62 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { botHasKickPermission, canKick, guildMeta, memberRecord, PERM_ADMINISTRATOR, PERM_KICK_MEMBERS } from '../src/discord.js';
+import {
+  botHasKickPermission,
+  canKick,
+  editOriginalReply,
+  guildMeta,
+  memberRecord,
+  PERM_ADMINISTRATOR,
+  PERM_KICK_MEMBERS,
+} from '../src/discord.js';
+
+async function withFetch(responses, fn) {
+  const calls = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    const [status, body] = responses[Math.min(calls.length - 1, responses.length - 1)];
+    return new Response(JSON.stringify(body), { status });
+  };
+  try {
+    return await fn(calls);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+const unknownWebhook = [404, { message: 'Unknown Webhook', code: 10015 }];
+const interaction = { application_id: '111', token: 'secret-token' };
+
+test('editOriginalReply retries until Discord has registered the deferred reply', async () => {
+  await withFetch([unknownWebhook, unknownWebhook, [200, { id: 'msg' }]], async (calls) => {
+    const waits = [];
+    const msg = await editOriginalReply(interaction, { content: 'hi' }, { wait: async (ms) => waits.push(ms) });
+    assert.equal(msg.id, 'msg');
+    assert.equal(calls.length, 3);
+    assert.deepEqual(waits, [500, 1000]);
+    assert.equal(calls[0].init.method, 'PATCH');
+    assert.match(calls[0].url, /\/webhooks\/111\/secret-token\/messages\/@original$/);
+    assert.equal(calls[0].init.headers.Authorization, undefined);
+    assert.deepEqual(JSON.parse(calls[0].init.body).allowed_mentions, { parse: [] });
+  });
+});
+
+test('editOriginalReply gives up after its retries and keeps the token out of the error', async () => {
+  await withFetch([unknownWebhook], async (calls) => {
+    const err = await editOriginalReply(interaction, { content: 'hi' }, { wait: async () => {} }).catch((e) => e);
+    assert.equal(calls.length, 5);
+    assert.equal(err.code, 10015);
+    assert.doesNotMatch(err.message, /secret-token/);
+  });
+});
+
+test('editOriginalReply does not retry other errors', async () => {
+  await withFetch([[403, { message: 'Missing Access', code: 50001 }]], async (calls) => {
+    await assert.rejects(editOriginalReply(interaction, { content: 'hi' }, { wait: async () => {} }));
+    assert.equal(calls.length, 1);
+  });
+});
 
 const meta = guildMeta({
   id: 'G',

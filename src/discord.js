@@ -37,7 +37,8 @@ export class BudgetExceeded extends Error {
 
 export class DiscordError extends Error {
   constructor(status, body, method, path) {
-    super(`Discord API ${method} ${path} failed (${status}): ${body?.message ?? 'no details'}`);
+    const shownPath = path.replace(/(\/webhooks\/\d+\/)[^/]+/, '$1…'); // keep interaction tokens out of logs
+    super(`Discord API ${method} ${shownPath} failed (${status}): ${body?.message ?? 'no details'}`);
     this.status = status;
     this.code = body?.code;
   }
@@ -70,6 +71,26 @@ export async function discordRest(token, method, path, { body, reason, budget, a
     return data;
   }
   throw new DiscordError(429, { message: 'still rate limited after retries' }, method, path);
+}
+
+const UNKNOWN_WEBHOOK = 10015;
+
+/**
+ * Replace a deferred interaction's "thinking..." message with the real reply.
+ * When a command finishes very fast, Discord may not have registered the
+ * deferred response yet and answers "Unknown Webhook"; wait a moment and retry.
+ */
+export async function editOriginalReply(interaction, reply, { delays = [500, 1000, 2000, 4000], wait = sleep } = {}) {
+  const path = `/webhooks/${interaction.application_id}/${interaction.token}/messages/@original`;
+  const body = { ...reply, allowed_mentions: { parse: [] } };
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await discordRest(null, 'PATCH', path, { body, auth: false });
+    } catch (err) {
+      if (err.code !== UNKNOWN_WEBHOOK || attempt >= delays.length) throw err;
+      await wait(delays[attempt]);
+    }
+  }
 }
 
 /** Convert a guild object from the API into what the bot keeps in memory. */

@@ -6,6 +6,7 @@
 // The always-on part (the Discord gateway connection, storage and kicking)
 // lives in the AutoKickBot Durable Object in bot.js.
 
+import { COMMAND_NAMES } from './commands.js';
 import { verifyDiscordRequest } from './verify.js';
 
 export { AutoKickBot } from './bot.js';
@@ -28,7 +29,7 @@ async function handleInteraction(request, env, ctx) {
   if (interaction.type === InteractionType.PING) {
     return Response.json({ type: ResponseType.PONG });
   }
-  if (interaction.type === InteractionType.APPLICATION_COMMAND && interaction.data?.name === 'autokick') {
+  if (interaction.type === InteractionType.APPLICATION_COMMAND && COMMAND_NAMES.has(interaction.data?.name)) {
     // Discord needs an answer within 3 seconds; reply "thinking..." now and
     // let the bot edit in the real answer when it's done.
     ctx.waitUntil(getBot(env).handleCommand(interaction));

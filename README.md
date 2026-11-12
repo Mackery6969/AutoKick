@@ -36,6 +36,7 @@ All commands are under `/autokick`. By default only members with **Manage Server
 | `/autokick logchannel [channel:]` | Post kicks and setting changes in a channel (leave empty to turn off) |
 | `/autokick whitelist add/remove/list` | Roles or members that are never kicked |
 | `/autokick blacklist add/remove/list` | Roles or members that can be kicked even if they have a whitelisted role |
+| `/ping` | Check the bot is online and replying (anyone can use it) |
 
 ### Whitelist and blacklist
 

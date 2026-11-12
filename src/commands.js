@@ -67,7 +67,15 @@ export const COMMANDS = [
       listGroup('blacklist', 'Roles and members that can be kicked even with a whitelisted role'),
     ],
   },
+  {
+    name: 'ping',
+    description: 'Check that the bot is online and replying',
+    contexts: [0],
+    integration_types: [0],
+  },
 ];
+
+export const COMMAND_NAMES = new Set(COMMANDS.map((c) => c.name));
 
 // ---------------------------------------------------------------- helpers
 
@@ -359,7 +367,25 @@ async function editList({ api, opts, interaction, userId }, listName, action) {
   return { content: `✅ Removed ${mention} from the ${listName}.` };
 }
 
+/** Discord IDs encode their creation time. */
+const snowflakeTime = (id) => Number((BigInt(id) >> 22n) + 1420070400000n);
+
+function ping(interaction, api) {
+  const lines = ['🏓 **Pong!**'];
+  if (interaction.id) {
+    lines.push(`• Your command reached me in ${Math.max(0, Date.now() - snowflakeTime(interaction.id))} ms`);
+  }
+  const latency = api.latency();
+  lines.push(
+    api.connected()
+      ? `• Connected to Discord${latency != null ? ` (heartbeat ${latency} ms)` : ''}`
+      : "• ⚠️ Not connected to Discord right now, so activity isn't being tracked.",
+  );
+  return { content: lines.join('\n') };
+}
+
 export async function runCommand(interaction, api) {
+  if (interaction.data?.name === 'ping') return ping(interaction, api);
   const top = interaction.data?.options?.[0];
   if (!top) return { content: 'Unknown command.' };
   const group = top.type === GROUP ? top.name : null;
