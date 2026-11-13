@@ -87,6 +87,21 @@ export const COMMANDS = [
       },
       {
         type: SUB,
+        name: 'warn',
+        description: 'DM members this many days before they are kicked (0 turns warnings off)',
+        options: [
+          {
+            type: INTEGER,
+            name: 'days',
+            description: 'Days of notice before a kick (0 = off)',
+            required: true,
+            min_value: 0,
+            max_value: 364,
+          },
+        ],
+      },
+      {
+        type: SUB,
         name: 'logchannel',
         description: 'Set where kicks are logged (leave empty to turn logging off)',
         options: [
@@ -144,9 +159,13 @@ const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 function tally(results) {
   return {
     due: results.filter((r) => r.result.action === 'kick'),
+    // Past the limit, but warnings are on and their notice hasn't run out (or they haven't been warned yet).
+    waiting: results.filter((r) => r.result.action === 'keep' && r.result.reason === 'notice'),
     blocked: results.filter((r) => r.result.action === 'blocked'),
   };
 }
+
+const warnSetting = (cfg) => (cfg.warnDays ? `${plural(cfg.warnDays, 'day')} before a kick` : 'Off');
 
 function formatList(list) {
   const items = [...list.roles.map((id) => `<@&${id}>`), ...list.users.map((id) => `<@${id}>`)];
@@ -244,12 +263,13 @@ const handlers = {
       await api.log(`▶️ AutoKick turned on by <@${userId}>.`).catch(() => {});
     }
     const { results, botCanKick } = await api.assessGuild();
-    const { due, blocked } = tally(results);
+    const { due, waiting, blocked } = tally(results);
     const powerWarning = kickPowerWarning(results, botCanKick);
 
     const lines = [
       wasOn ? '✅ AutoKick was already **on**.' : '✅ **AutoKick is on.**',
-      `Members are kicked after **${cfg.days} days** without sending a message or being in a voice channel.`,
+      `Members are kicked after **${cfg.days} days** without sending a message or being in a voice channel.` +
+        (cfg.warnDays ? ` They get a warning DM ${plural(cfg.warnDays, 'day')} before.` : ''),
     ];
     const earliest = cfg.trackingSince + cfg.days * DAY_MS;
     if (earliest > Date.now()) {
@@ -257,10 +277,15 @@ const handlers = {
         `• I started tracking activity ${ts(cfg.trackingSince, 'D')}, so nobody can be kicked before ${ts(earliest, 'D')}.`,
       );
     }
-    if (due.length) {
+    const past = due.length + waiting.length;
+    if (past) {
+      const when =
+        cfg.warnDays && !due.length
+          ? `They get a warning DM first (no sooner than ${ts(firstKickAt(cfg, api))}) and are kicked ` +
+            `${plural(cfg.warnDays, 'day')} later if they stay inactive.`
+          : `Kicks start no sooner than ${ts(firstKickAt(cfg, api))}.`;
       lines.push(
-        `• **${plural(due.length, 'member')}** ${due.length === 1 ? 'is' : 'are'} past the limit. ` +
-          `Kicks start no sooner than ${ts(firstKickAt(cfg, api))}. ` +
+        `• **${plural(past, 'member')}** ${past === 1 ? 'is' : 'are'} past the limit. ${when} ` +
           'Use `/autokick preview` to see who, or `/autokick disable` to stop.',
       );
     } else {
@@ -286,7 +311,10 @@ const handlers = {
 
   async status({ api }) {
     const { cfg, results, detectedPauseRoles, botCanKick } = await api.assessGuild();
-    const { due, blocked } = tally(results);
+    const { due, waiting, blocked } = tally(results);
+    const pastNotes = [];
+    if (waiting.length) pastNotes.push(`${waiting.length} still in their warning period`);
+    if (blocked.length) pastNotes.push(`+${blocked.length} I can't kick`);
     const muted = results.filter((r) => r.result.action === 'paused').length;
     const powerWarning = kickPowerWarning(results, botCanKick);
     const hidden = await api.hiddenChannels().catch(() => undefined);
@@ -300,12 +328,13 @@ const handlers = {
       fields: [
         { name: 'Auto-kick', value: state, inline: true },
         { name: 'Inactivity limit', value: plural(cfg.days, 'day'), inline: true },
+        { name: 'Warning DM', value: warnSetting(cfg), inline: true },
         { name: 'Log channel', value: cfg.logChannelId ? `<#${cfg.logChannelId}>` : 'Not set', inline: true },
         { name: 'Tracking since', value: ts(cfg.trackingSince, 'D'), inline: true },
         { name: 'Next check', value: cfg.enabled ? ts(firstKickAt(cfg, api)) : '—', inline: true },
         {
           name: 'Past the limit',
-          value: `${due.length}${blocked.length ? ` (+${blocked.length} I can't kick)` : ''}`,
+          value: `${due.length + waiting.length}${pastNotes.length ? ` (${pastNotes.join(', ')})` : ''}`,
           inline: true,
         },
         { name: 'Muted right now (clock paused)', value: String(muted), inline: true },
@@ -335,15 +364,22 @@ const handlers = {
 
   async preview({ api }) {
     const { cfg, results } = await api.assessGuild();
-    const { due, blocked } = tally(results);
-    if (!due.length && !blocked.length) {
+    const { due, waiting, blocked } = tally(results);
+    if (!due.length && !waiting.length && !blocked.length) {
       return { content: `Nobody has been inactive for ${plural(cfg.days, 'day')} or more. ✨` };
     }
-    due.sort((a, b) => b.result.inactiveMs - a.result.inactiveMs);
+    const longestFirst = (a, b) => b.result.inactiveMs - a.result.inactiveMs;
+    due.sort(longestFirst);
+    waiting.sort(longestFirst);
 
     const line = ({ member, result }) =>
       `• <@${member.id}> (${escapeMarkdown(member.username)}): inactive ${formatDuration(result.inactiveMs)}` +
       (result.recorded ? `, last seen ${ts(result.lastActive)}` : ', no activity recorded');
+    const noticeLine = (entry) =>
+      line(entry) +
+      (entry.result.warning
+        ? `. Warned ${ts(entry.result.warning.at)}, kicked ${ts(Date.now() + entry.result.remainingMs)}`
+        : '. Not warned yet');
 
     const parts = [];
     if (due.length) {
@@ -354,8 +390,17 @@ const handlers = {
       );
       parts.push(...due.map(line));
     }
+    if (waiting.length) {
+      if (parts.length) parts.push('');
+      parts.push(
+        `**${plural(waiting.length, 'member')} past the limit ${waiting.length === 1 ? 'is' : 'are'} in their warning period** ` +
+          "(kicked once it ends, if they're still inactive):",
+      );
+      parts.push(...waiting.map(noticeLine));
+    }
     if (blocked.length) {
-      parts.push('', `**${plural(blocked.length, 'member')} past the limit that I can't kick**: ${BLOCKED_HELP}`);
+      if (parts.length) parts.push('');
+      parts.push(`**${plural(blocked.length, 'member')} past the limit that I can't kick**: ${BLOCKED_HELP}`);
       parts.push(...blocked.map(line));
     }
 
@@ -403,9 +448,23 @@ const handlers = {
       case 'blocked':
         lines.push(`🟠 Past the limit, but I can't kick them: ${BLOCKED_HELP}`);
         break;
-      case 'keep':
-        lines.push(`🟢 Fine for now. Would be kicked ${ts(Date.now() + result.remainingMs)} if they stay inactive.`);
+      case 'keep': {
+        const kickAt = Date.now() + result.remainingMs;
+        const past = result.reason === 'notice' ? 'Past the limit. ' : '';
+        if (result.warning) {
+          const missed = result.warning.delivered ? '' : " (their DMs are closed, so it didn't reach them)";
+          lines.push(`🟡 ${past}Warned ${ts(result.warning.at)}${missed}. Will be kicked ${ts(kickAt)} if they stay inactive.`);
+        } else if (result.warnNow) {
+          const send = cfg.enabled
+            ? `Gets a warning DM at the next check (${ts(firstKickAt(cfg, api))})`
+            : 'Would get a warning DM now, but AutoKick is off';
+          lines.push(`🟡 ${past}${send}, and can't be kicked until ${plural(cfg.warnDays, 'day')} after it.`);
+        } else {
+          const warnFirst = cfg.warnDays ? ` They'd get a warning DM ${plural(cfg.warnDays, 'day')} before.` : '';
+          lines.push(`🟢 Fine for now. Would be kicked ${ts(kickAt)} if they stay inactive.${warnFirst}`);
+        }
         break;
+      }
       case 'protected':
         lines.push(
           result.reason === 'whitelisted role'
@@ -436,18 +495,74 @@ const handlers = {
     // Lowering the limit while on could suddenly make lots of people kickable:
     // give admins the same one-hour window as when turning it on.
     if (cfg.enabled && cfg.days < previous) cfg.armedAt = Math.max(cfg.armedAt ?? 0, Date.now() + api.enableGraceMs);
+    // A warning has to come before the kick; if it no longer fits, turn warnings off and say so.
+    const droppedWarn = cfg.warnDays && cfg.warnDays >= cfg.days ? cfg.warnDays : 0;
+    if (droppedWarn) cfg.warnDays = 0;
     api.saveConfig(cfg);
-    await api.log(`⚙️ Inactivity limit changed from ${previous} to ${cfg.days} days by <@${userId}>.`).catch(() => {});
+    await api
+      .log(
+        `⚙️ Inactivity limit changed from ${previous} to ${cfg.days} days by <@${userId}>.` +
+          (droppedWarn ? ' Warning DMs turned off (they no longer fit before the limit).' : ''),
+      )
+      .catch(() => {});
 
-    const { due } = tally((await api.assessGuild()).results);
+    const { due, waiting } = tally((await api.assessGuild()).results);
+    const past = due.length + waiting.length;
     const after = cfg.enabled
       ? ` Kicks start no sooner than ${ts(firstKickAt(cfg, api))}.`
       : ' AutoKick is off, so nobody will be kicked until `/autokick enable`.';
-    return {
-      content:
-        `✅ Members will now be kicked after **${plural(cfg.days, 'day')}** of inactivity. ` +
-        `${plural(due.length, 'member')} ${due.length === 1 ? 'is' : 'are'} past that right now.${after}`,
-    };
+    const lines = [
+      `✅ Members will now be kicked after **${plural(cfg.days, 'day')}** of inactivity. ` +
+        `${plural(past, 'member')} ${past === 1 ? 'is' : 'are'} past that right now.${after}`,
+    ];
+    if (droppedWarn) {
+      lines.push(
+        `⚠️ Warning DMs were set to ${plural(droppedWarn, 'day')} before a kick, which doesn't fit in a ` +
+          `${plural(cfg.days, 'day')} limit, so I turned them off. Set them again with \`/autokick warn\`.`,
+      );
+    }
+    return { content: lines.join('\n') };
+  },
+
+  async warn({ api, opts, userId }) {
+    const cfg = api.getConfig();
+    const days = opts.days;
+    const previous = cfg.warnDays ?? 0;
+    if (days >= cfg.days) {
+      return {
+        content:
+          `❌ The warning has to come before the kick, so it must be less than the **${plural(cfg.days, 'day')}** limit. ` +
+          'Pick a smaller number, or raise the limit first with `/autokick days`.',
+      };
+    }
+    if (days === previous) {
+      return { content: days ? `Warning DMs are already set to ${plural(days, 'day')} before a kick.` : 'Warning DMs are already **off**.' };
+    }
+    cfg.warnDays = days;
+    api.saveConfig(cfg);
+    await api
+      .log(
+        days
+          ? `⚙️ Warning DMs set to ${plural(days, 'day')} before a kick by <@${userId}>.`
+          : `⚙️ Warning DMs turned off by <@${userId}>.`,
+      )
+      .catch(() => {});
+
+    if (!days) {
+      return {
+        content:
+          '✅ Warning DMs are **off**. Members only get a DM when they are kicked. ' +
+          "Anyone already warned keeps the date they were given, so they won't be kicked before it.",
+      };
+    }
+    const lines = [
+      `✅ Members now get a DM **${plural(days, 'day')}** before they're kicked, and can't be kicked until ` +
+        `${plural(days, 'day')} after it, even if they're already past the limit.`,
+      'If they send a message or join voice before then, their clock resets and the warning no longer counts.',
+      "Members with DMs closed can't receive it; they're still kicked on the same schedule.",
+    ];
+    if (!cfg.enabled) lines.push('AutoKick is off, so no warnings go out until `/autokick enable`.');
+    return { content: lines.join('\n') };
   },
 
   async logchannel({ api, opts, userId }) {
@@ -461,7 +576,7 @@ const handlers = {
     cfg.logChannelId = opts.channel;
     api.saveConfig(cfg);
     try {
-      await api.log(`📋 AutoKick will post kicks and setting changes here (set by <@${userId}>).`);
+      await api.log(`📋 AutoKick will post kicks, warnings and setting changes here (set by <@${userId}>).`);
     } catch (err) {
       cfg.logChannelId = previous;
       api.saveConfig(cfg);

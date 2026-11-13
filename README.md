@@ -27,6 +27,7 @@ Pause roles are any role named like "Muted" or "Mute" (picked up automatically),
 - **Clean slate when the bot joins.** The bot can't see history from before it was added, so everyone's clock starts on the day it started tracking. New members' clocks start when they join.
 - **Bot downtime isn't held against anyone.** If the bot is offline for a while, that time isn't counted as inactivity.
 - Kicked members get a DM (if their DMs are open) saying why and that they can rejoin.
+- **Optional warning DM** before a kick: `/autokick warn days:7` messages members 7 days before they'd be kicked (`days:0` turns it off; it's off by default). Nobody is kicked until the date their warning gave them, even if they were already past the limit when warnings were turned on. One warning per stretch of inactivity: being active again resets it. Members with DMs closed are still kicked on the same schedule. Warnings go out at most 10 per minute per server, and are posted in the log channel.
 
 ## Commands
 
@@ -40,7 +41,8 @@ All commands are under `/autokick`. By default only members with **Manage Server
 | `/autokick preview` | Who would be kicked right now |
 | `/autokick check member:` | One member's last activity and status |
 | `/autokick days days:` | Change the limit (1–365 days, default 30) |
-| `/autokick logchannel [channel:]` | Post kicks and setting changes in a channel (leave empty to turn off) |
+| `/autokick warn days:` | DM members this many days before they're kicked (0 = off, the default) |
+| `/autokick logchannel [channel:]` | Post kicks, warnings and setting changes in a channel (leave empty to turn off) |
 | `/autokick whitelist add/remove/list/reset` | Roles or members that are never kicked |
 | `/autokick blacklist add/remove/list/reset` | Roles or members that can be kicked even if they have a whitelisted role |
 | `/autokick channel-whitelist add/remove/list/reset` | If set, only activity in these channels/categories counts |

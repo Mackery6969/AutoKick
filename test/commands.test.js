@@ -349,6 +349,73 @@ test('blacklist reset clears it without touching the grace period', async () => 
   assert.match(reply.content, /Cleared the blacklist \(1 entry: <@U1>\)\.$/);
 });
 
+test('warn sets, refuses and turns off the warning DM', async () => {
+  const api = fakeApi({ cfg: { ...baseConfig(), enabled: true } });
+  const warn = async (days) => (await runCommand(sub('warn', [{ name: 'days', type: 4, value: days }]), api)).content;
+
+  assert.match(await warn(7), /DM \*\*7 days\*\* before they're kicked/);
+  assert.equal(api.state.cfg.warnDays, 7);
+  assert.match(api.state.logs.at(-1), /Warning DMs set to 7 days/);
+  assert.match(await warn(7), /already set to 7 days/);
+
+  assert.match(await warn(30), /must be less than the \*\*30 days\*\* limit/);
+  assert.equal(api.state.cfg.warnDays, 7, 'unchanged');
+
+  assert.match(await warn(0), /Warning DMs are \*\*off\*\*.*keeps the date/);
+  assert.equal(api.state.cfg.warnDays, 0);
+  assert.match(await warn(0), /already \*\*off\*\*/);
+});
+
+test('lowering the limit below the warning turns warnings off and says so', async () => {
+  const api = fakeApi({ cfg: { ...baseConfig(), warnDays: 10 } });
+  const reply = await runCommand(sub('days', [{ name: 'days', type: 4, value: 7 }]), api);
+  assert.equal(api.state.cfg.warnDays, 0);
+  assert.match(reply.content, /Warning DMs were set to 10 days .* so I turned them off/);
+
+  const keeps = fakeApi({ cfg: { ...baseConfig(), warnDays: 3 } });
+  const fine = await runCommand(sub('days', [{ name: 'days', type: 4, value: 7 }]), keeps);
+  assert.equal(keeps.state.cfg.warnDays, 3);
+  assert.doesNotMatch(fine.content, /turned them off/);
+});
+
+test('status, preview and check show warnings', async () => {
+  const now = Date.now();
+  const cfg = { ...baseConfig(), enabled: true, warnDays: 7 };
+  const api = fakeApi({
+    cfg,
+    results: [
+      result('due', 'kick', { kickable: true }),
+      result('warned', 'keep', {
+        reason: 'notice',
+        kickable: true,
+        remainingMs: 2 * DAY_MS,
+        warning: { at: now - 5 * DAY_MS, kickAfter: now + 2 * DAY_MS, delivered: false },
+      }),
+      result('next', 'keep', { reason: 'notice', kickable: true, remainingMs: 7 * DAY_MS, warnNow: true, warning: null }),
+      result('soon', 'keep', { reason: 'active', kickable: true, inactiveMs: 10 * DAY_MS, remainingMs: 20 * DAY_MS, warning: null }),
+    ],
+  });
+
+  const fields = Object.fromEntries((await runCommand(sub('status'), api)).embeds[0].fields.map((f) => [f.name, f.value]));
+  assert.equal(fields['Warning DM'], '7 days before a kick');
+  assert.equal(fields['Past the limit'], '3 (2 still in their warning period)');
+
+  const preview = (await runCommand(sub('preview'), api)).embeds[0].description;
+  assert.match(preview, /1 member will be kicked/);
+  assert.match(preview, /2 members past the limit are in their warning period/);
+  assert.match(preview, /<@warned>.*Warned <t:\d+:R>, kicked <t:\d+:R>/);
+  assert.match(preview, /<@next>.*Not warned yet/);
+
+  const check = async (id) => (await runCommand(sub('check', [{ name: 'member', type: 6, value: id }]), api)).content;
+  assert.match(await check('warned'), /🟡 Past the limit\. Warned <t:\d+:R> \(their DMs are closed, so it didn't reach them\)\. Will be kicked/);
+  assert.match(await check('next'), /Gets a warning DM at the next check .*can't be kicked until 7 days after it/);
+  assert.match(await check('soon'), /🟢 Fine for now\..*warning DM 7 days before/);
+
+  const enable = await runCommand(sub('enable'), fakeApi({ cfg: { ...cfg, enabled: false }, results: [result('next', 'keep', { reason: 'notice' })] }));
+  assert.match(enable.content, /warning DM 7 days before/);
+  assert.match(enable.content, /1 member\*\* is past the limit\. They get a warning DM first .* kicked 7 days later/);
+});
+
 test('check explains protection', async () => {
   const api = fakeApi({ results: [result('a', 'protected', { reason: 'whitelisted role', roleId: 'R9' })] });
   const reply = await runCommand(sub('check', [{ name: 'member', type: 6, value: 'a' }]), api);

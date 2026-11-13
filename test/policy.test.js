@@ -11,6 +11,7 @@ import {
   mergeIntervals,
   observedInactiveMs,
   pauseChanges,
+  warningMs,
 } from '../src/policy.js';
 
 const cfg = (overrides = {}) => ({
@@ -124,6 +125,71 @@ test('assess reports which list entry applies and whether the member is kickable
   assert.deepEqual(result.listed, { reason: 'blacklisted role', roleId: 'trial' });
   assert.equal(result.kickable, false);
   assert.equal(assess(plain({}), cfg(), { now: DAY_MS, downtime: [] }).listed, null);
+});
+
+test('warnings: a DM is due inside the warning window, then the kick waits for the notice', () => {
+  const now = 100 * DAY_MS;
+  const c = cfg({ warnDays: 7, activity: { m: now - 25 * DAY_MS } }); // 25 of 30 days used
+  const ctx = { now, downtime: [] };
+
+  const due = assess(plain(), c, ctx);
+  assert.equal(due.action, 'keep');
+  assert.equal(due.reason, 'active');
+  assert.equal(due.warnNow, true, '5 days left is inside the 7-day window');
+  assert.equal(due.remainingMs, 7 * DAY_MS, 'not kicked until 7 days after the warning');
+
+  const early = assess(plain(), cfg({ warnDays: 7, activity: { m: now - 20 * DAY_MS } }), ctx);
+  assert.equal(early.warnNow, false, '10 days left: too early to warn');
+  assert.equal(early.remainingMs, 10 * DAY_MS);
+
+  const warning = { at: now - 2 * DAY_MS, kickAfter: now + 5 * DAY_MS, delivered: true };
+  const warned = assess(plain({ warning }), c, ctx);
+  assert.equal(warned.warnNow, false, 'warned once per stretch of inactivity');
+  assert.deepEqual(warned.warning, warning);
+  assert.equal(warned.remainingMs, 5 * DAY_MS);
+
+  const fresh = assess(plain({ warning }), cfg({ warnDays: 7, activity: { m: now - DAY_MS } }), ctx);
+  assert.equal(fresh.warning, null, 'active again since the warning: it no longer counts');
+  assert.equal(fresh.warnNow, false);
+});
+
+test('warnings: members already past the limit are warned before they can be kicked', () => {
+  const now = 100 * DAY_MS;
+  const c = cfg({ warnDays: 3, activity: { m: now - 50 * DAY_MS } });
+  const ctx = { now, downtime: [] };
+
+  const unwarned = assess(plain(), c, ctx);
+  assert.equal(unwarned.action, 'keep');
+  assert.equal(unwarned.reason, 'notice');
+  assert.equal(unwarned.warnNow, true);
+  assert.equal(unwarned.remainingMs, 3 * DAY_MS);
+
+  const waiting = assess(plain({ warning: { at: now - DAY_MS, kickAfter: now + 2 * DAY_MS } }), c, ctx);
+  assert.equal(waiting.action, 'keep');
+  assert.equal(waiting.reason, 'notice');
+  assert.equal(waiting.remainingMs, 2 * DAY_MS);
+
+  const served = assess(plain({ warning: { at: now - 3 * DAY_MS, kickAfter: now } }), c, ctx);
+  assert.equal(served.action, 'kick');
+
+  // Turning warnings off later doesn't cut short a date already given.
+  const off = assess(plain({ warning: { at: now - DAY_MS, kickAfter: now + 2 * DAY_MS } }), cfg({ activity: c.activity }), ctx);
+  assert.equal(off.action, 'keep');
+
+  const blocked = assess(plain({ kickable: false }), c, ctx);
+  assert.equal(blocked.action, 'blocked', "no warning for someone the bot can't kick");
+  assert.equal(blocked.warnNow, false);
+
+  const muted = assess(plain({ pausedBy: 'timeout' }), c, ctx);
+  assert.equal(muted.action, 'paused');
+  assert.equal(muted.warnNow, false, 'no warnings while muted');
+});
+
+test('warningMs is off at 0 and when it would not fit before the limit', () => {
+  assert.equal(warningMs(cfg()), 0);
+  assert.equal(warningMs(cfg({ warnDays: 0 })), 0);
+  assert.equal(warningMs(cfg({ warnDays: 7 })), 7 * DAY_MS);
+  assert.equal(warningMs(cfg({ warnDays: 30 })), 0);
 });
 
 test('a whitelisted member stays protected even while muted', () => {

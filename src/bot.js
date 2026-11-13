@@ -47,6 +47,10 @@ const MAX_BACKOFF_MS = 15 * 60_000;
 // per day; this cap makes sure a reconnect loop can never get anywhere near that.
 const MAX_IDENTIFIES_PER_DAY = 200;
 const KICK_RETRY_MS = 6 * 60 * 60_000;
+const WARN_RETRY_MS = 60 * 60_000;
+// Warning DMs go out at most this many per server per minute, so turning
+// warnings on in a big server spreads the first batch out instead of mass-DMing.
+const MAX_WARNINGS_PER_RUN = 10;
 const REQUEST_BUDGET = 44; // leaves headroom under the free plan's 50
 const DEFAULT_GATEWAY = 'wss://gateway.discord.gg';
 const COUNTED_MESSAGE_TYPES = new Set([0, 18, 19]); // normal message, thread created, reply
@@ -90,6 +94,7 @@ function defaultConfig(now) {
     blacklist: { roles: [], users: [] },
     pauseRoles: [], // members with these roles don't lose time (plus auto-detected "Muted" roles)
     channels: { whitelist: [], blacklist: [] }, // where activity counts (channels, categories, threads)
+    warnDays: 0, // DM members this many days before a kick (0 = off)
   };
 }
 
@@ -116,6 +121,11 @@ export class AutoKickBot extends DurableObject {
       guild_id TEXT NOT NULL, user_id TEXT NOT NULL, kind TEXT NOT NULL,
       started_at INTEGER NOT NULL, ended_at INTEGER)`);
     this.sql.exec('CREATE INDEX IF NOT EXISTS pauses_member ON pauses (guild_id, user_id)');
+    // The last warning DM per member, and the date it told them they'd be kicked.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS warnings (
+      guild_id TEXT NOT NULL, user_id TEXT NOT NULL, warned_at INTEGER NOT NULL,
+      kick_after INTEGER NOT NULL, delivered INTEGER NOT NULL,
+      PRIMARY KEY (guild_id, user_id))`);
 
     this.ws = null;
     this.ready = false;
@@ -132,6 +142,7 @@ export class AutoKickBot extends DurableObject {
     this.memberCache = new Map(); // guildId -> { fetchedAt, members: Map<userId, record> }
     this.channelParents = new Map(); // guildId -> Map<channelId, parentId|null> (thread → channel → category)
     this.kickFailures = new Map(); // "guild:user" -> time of last failed kick
+    this.warnFailures = new Map(); // "guild:user" -> time of last warning DM that failed on Discord's side
   }
 
   // ---------------------------------------------------------------- storage
@@ -266,6 +277,17 @@ export class AutoKickBot extends DurableObject {
     return byUser;
   }
 
+  /** Last warning DM per member: userId -> { at, kickAfter, delivered }. */
+  warningRows(guildId, userId = null) {
+    const query = 'SELECT user_id, warned_at, kick_after, delivered FROM warnings WHERE guild_id = ?';
+    const rows = userId
+      ? this.sql.exec(`${query} AND user_id = ?`, guildId, userId).toArray()
+      : this.sql.exec(query, guildId).toArray();
+    return new Map(
+      rows.map((r) => [r.user_id, { at: r.warned_at, kickAfter: r.kick_after, delivered: Boolean(r.delivered) }]),
+    );
+  }
+
   /**
    * Record when a member becomes muted (timed out, or given a pause role) and
    * when that stops. `pauseRoles` is null when the server's roles aren't known
@@ -294,6 +316,7 @@ export class AutoKickBot extends DurableObject {
     this.sql.exec('DELETE FROM activity WHERE guild_id = ? AND user_id = ?', guildId, userId);
     this.sql.exec('DELETE FROM voice WHERE guild_id = ? AND user_id = ?', guildId, userId);
     this.sql.exec('DELETE FROM pauses WHERE guild_id = ? AND user_id = ?', guildId, userId);
+    this.sql.exec('DELETE FROM warnings WHERE guild_id = ? AND user_id = ?', guildId, userId);
     this.lastWrite.delete(`${guildId}:${userId}`);
     this.recent.get(guildId)?.delete(userId);
     this.memberCache.get(guildId)?.members.delete(userId);
@@ -304,6 +327,7 @@ export class AutoKickBot extends DurableObject {
     this.sql.exec('DELETE FROM activity WHERE guild_id = ?', guildId);
     this.sql.exec('DELETE FROM voice WHERE guild_id = ?', guildId);
     this.sql.exec('DELETE FROM pauses WHERE guild_id = ?', guildId);
+    this.sql.exec('DELETE FROM warnings WHERE guild_id = ?', guildId);
     this.recent.delete(guildId);
     this.channelParents.delete(guildId);
     this.guildCache.delete(guildId);
@@ -736,7 +760,7 @@ export class AutoKickBot extends DurableObject {
     return { meta, members: cache.members };
   }
 
-  assessWith(cfg, meta, botMember, member, pauseRows, ctx) {
+  assessWith(cfg, meta, botMember, member, pauseRows, warning, ctx) {
     const { now } = ctx;
     const current = pauseRows.find((r) => r.started_at <= now && (r.ended_at === null || r.ended_at > now));
     const snapshot = {
@@ -745,6 +769,7 @@ export class AutoKickBot extends DurableObject {
       kickable: canKick(meta, botMember, member),
       pauses: pauseRows.map((r) => [r.started_at, r.ended_at ?? now]),
       pausedBy: current?.kind ?? null,
+      warning,
     };
     return assess(snapshot, cfg, ctx);
   }
@@ -769,9 +794,10 @@ export class AutoKickBot extends DurableObject {
     const botMember = members.get(this.getState('botId'));
     const full = { ...cfg, activity: this.activityMap(guildId) };
     const ctx = { now, downtime: this.getState('downtime', []) };
+    const warnings = this.warningRows(guildId);
     const results = [...members.values()].map((member) => ({
       member,
-      result: this.assessWith(full, meta, botMember, member, pauses.get(member.id) ?? [], ctx),
+      result: this.assessWith(full, meta, botMember, member, pauses.get(member.id) ?? [], warnings.get(member.id) ?? null, ctx),
     }));
     return {
       cfg,
@@ -794,7 +820,8 @@ export class AutoKickBot extends DurableObject {
     const full = { ...cfg, activity: this.activityMap(guildId) };
     const ctx = { now, downtime: this.getState('downtime', []) };
     const botMember = members.get(this.getState('botId'));
-    return { member, result: this.assessWith(full, meta, botMember, member, pauses.get(userId) ?? [], ctx) };
+    const warning = this.warningRows(guildId, userId).get(userId) ?? null;
+    return { member, result: this.assessWith(full, meta, botMember, member, pauses.get(userId) ?? [], warning, ctx) };
   }
 
   /**
@@ -872,18 +899,30 @@ export class AutoKickBot extends DurableObject {
     try {
       const { meta, results } = await this.assessGuild(guildId, budget);
       const now = Date.now();
+      const retryOk = (failures, memberId, wait) => {
+        const failedAt = failures.get(`${guildId}:${memberId}`);
+        return !failedAt || now - failedAt > wait;
+      };
+      const byInactivity = (a, b) => b.result.inactiveMs - a.result.inactiveMs;
       const targets = results
-        .filter(({ member, result }) => {
-          if (result.action !== 'kick') return false;
-          const failedAt = this.kickFailures.get(`${guildId}:${member.id}`);
-          return !failedAt || now - failedAt > KICK_RETRY_MS;
-        })
-        .sort((a, b) => b.result.inactiveMs - a.result.inactiveMs);
+        .filter(({ member, result }) => result.action === 'kick' && retryOk(this.kickFailures, member.id, KICK_RETRY_MS))
+        .sort(byInactivity);
+      const toWarn = results
+        .filter(({ member, result }) => result.warnNow && retryOk(this.warnFailures, member.id, WARN_RETRY_MS))
+        .sort(byInactivity);
 
       for (const { member, result } of targets) {
         if (budget.remaining < 4) return false;
         if (!this.getConfig(guildId)?.enabled) return true; // turned off mid-sweep
         await this.kickMember(guildId, meta, member, result, budget);
+      }
+      let warned = 0;
+      for (const { member, result } of toWarn) {
+        if (budget.remaining < 3 || warned >= MAX_WARNINGS_PER_RUN) return false; // the rest next minute
+        const latest = this.getConfig(guildId);
+        if (!latest?.enabled) return true; // turned off mid-sweep
+        await this.warnMember(guildId, meta, latest, member, result, budget);
+        warned += 1;
       }
       return true;
     } catch (err) {
@@ -927,6 +966,64 @@ export class AutoKickBot extends DurableObject {
     await this.log(
       guildId,
       `👢 Kicked <@${member.id}> (**${escapeMarkdown(member.username)}**): no messages or voice activity for ${duration}.`,
+      budget,
+    ).catch((err) => {
+      if (err instanceof BudgetExceeded) throw err;
+    });
+  }
+
+  /**
+   * DM a member that they'll be kicked if they stay inactive, and record the
+   * date it gives them (they can't be kicked before it). If their DMs are
+   * closed the date still stands; if Discord itself fails, try again later.
+   */
+  async warnMember(guildId, meta, cfg, member, result, budget) {
+    const now = Date.now();
+    const kickAfter = now + result.remainingMs;
+    const when = `<t:${Math.floor(kickAfter / 1000)}:R>`;
+    const inactive = formatDuration(result.inactiveMs);
+    const only = cfg.channels.whitelist.length
+      ? `\nOnly activity in these channels counts: ${cfg.channels.whitelist.slice(0, 20).map((id) => `<#${id}>`).join(', ')}`
+      : '';
+    let delivered = true;
+    try {
+      const dm = await this.rest('POST', '/users/@me/channels', { body: { recipient_id: member.id }, budget });
+      await this.rest('POST', `/channels/${dm.id}/messages`, {
+        body: {
+          content:
+            `⚠️ You haven't sent a message or joined a voice channel in **${escapeMarkdown(meta.name)}** for ${inactive}. ` +
+            `If that doesn't change, you'll be removed from the server ${when} ` +
+            `(<t:${Math.floor(kickAfter / 1000)}:f>).\n` +
+            `To stay, send a message or join a voice channel there (not deafened) before then.${only}`,
+          allowed_mentions: { parse: [] },
+        },
+        budget,
+      });
+    } catch (err) {
+      if (err instanceof BudgetExceeded) throw err;
+      if (!(err.status >= 400 && err.status < 500 && err.status !== 429)) {
+        this.warnFailures.set(`${guildId}:${member.id}`, now);
+        console.warn(`Could not warn ${member.id} in ${guildId}: ${err.message}`);
+        return;
+      }
+      delivered = false; // DMs closed or the bot is blocked
+    }
+
+    this.sql.exec(
+      `INSERT INTO warnings (guild_id, user_id, warned_at, kick_after, delivered) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(guild_id, user_id) DO UPDATE SET
+         warned_at = excluded.warned_at, kick_after = excluded.kick_after, delivered = excluded.delivered`,
+      guildId,
+      member.id,
+      now,
+      kickAfter,
+      delivered ? 1 : 0,
+    );
+    await this.log(
+      guildId,
+      `⚠️ Warned <@${member.id}> (**${escapeMarkdown(member.username)}**): inactive ${inactive}, ` +
+        `will be kicked ${when} if they stay inactive.` +
+        (delivered ? '' : " Their DMs are closed, so the warning didn't reach them."),
       budget,
     ).catch((err) => {
       if (err instanceof BudgetExceeded) throw err;

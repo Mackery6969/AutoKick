@@ -91,25 +91,36 @@ export function observedInactiveMs(lastActive, now, excluded = []) {
   return Math.max(0, ms);
 }
 
+/** How long before a kick members get a warning DM, or 0 when warnings are off. */
+export function warningMs(cfg) {
+  const days = cfg.warnDays ?? 0;
+  return days > 0 && days < cfg.days ? days * DAY_MS : 0;
+}
+
 /**
  * Assess one member. `member` is a plain snapshot:
- *   { id, bot, isOwner, kickable, roleIds, joinedTimestamp, pauses?, pausedBy? }
+ *   { id, bot, isOwner, kickable, roleIds, joinedTimestamp, pauses?, pausedBy?, warning? }
  * `pauses` are this member's muted periods as [start, end]; `pausedBy` is set
- * ('timeout' or 'role') when they are muted right now.
+ * ('timeout' or 'role') when they are muted right now. `warning` is the last
+ * warning DM sent to them: { at, kickAfter, delivered }.
  *
  * Returns an object whose `action` is one of:
- *   'kick'      - past the limit and the bot is able to kick them
+ *   'kick'      - past the limit (and any warning period) and the bot is able to kick them
  *   'blocked'   - past the limit, but the bot's role is too low / lacks permission
- *   'keep'      - still within the limit
+ *   'keep'      - still within the limit (reason 'active'), or past it but still
+ *                 inside the notice their warning DM gave them (reason 'notice')
  *   'paused'    - muted right now, so their clock is stopped and they can't be kicked
  *   'protected' - covered by the whitelist
  *   'skip'      - bots and the server owner are never kicked
+ * `warnNow` is true when a warning DM should be sent now.
  */
 export function assess(member, cfg, { now, downtime }) {
   const lastActive = lastActiveAt(cfg, member.id, member.joinedTimestamp);
   const inactiveMs = observedInactiveMs(lastActive, now, [...downtime, ...(member.pauses ?? [])]);
   const pausedMs = observedInactiveMs(lastActive, now, downtime) - inactiveMs;
   const thresholdMs = cfg.days * DAY_MS;
+  // A warning only counts for the stretch of inactivity it was sent in.
+  const warning = member.warning && member.warning.at >= lastActive ? member.warning : null;
   const base = {
     lastActive,
     inactiveMs,
@@ -117,6 +128,8 @@ export function assess(member, cfg, { now, downtime }) {
     thresholdMs,
     recorded: member.id in cfg.activity,
     kickable: Boolean(member.kickable),
+    warning,
+    warnNow: false,
   };
 
   if (member.bot) return { ...base, action: 'skip', reason: 'bot' };
@@ -128,11 +141,22 @@ export function assess(member, cfg, { now, downtime }) {
   if (list.protected) {
     return { ...listed, action: 'protected', reason: list.reason, roleId: list.roleId };
   }
+
+  // With warnings on, nobody is kicked until the date their warning DM gave them.
+  // A warning already sent keeps its date even if the setting changes later.
+  const warnMs = warningMs(cfg);
+  let noticeLeftMs = 0;
+  if (warning) noticeLeftMs = Math.max(0, warning.kickAfter - now);
+  else if (warnMs && member.kickable) noticeLeftMs = warnMs;
+  const remainingMs = Math.max(0, thresholdMs - inactiveMs, noticeLeftMs);
+
   if (member.pausedBy) {
-    return { ...listed, action: 'paused', reason: member.pausedBy, remainingMs: Math.max(0, thresholdMs - inactiveMs) };
+    return { ...listed, action: 'paused', reason: member.pausedBy, remainingMs };
   }
-  if (inactiveMs < thresholdMs) {
-    return { ...listed, action: 'keep', reason: 'active', remainingMs: thresholdMs - inactiveMs };
+  if (remainingMs > 0) {
+    const warnNow = Boolean(warnMs) && Boolean(member.kickable) && !warning && thresholdMs - inactiveMs <= warnMs;
+    const reason = inactiveMs < thresholdMs ? 'active' : 'notice';
+    return { ...listed, action: 'keep', reason, remainingMs, warnNow };
   }
   if (!member.kickable) {
     return { ...listed, action: 'blocked', reason: 'role is above the bot or bot lacks Kick Members' };
