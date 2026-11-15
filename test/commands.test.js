@@ -13,9 +13,21 @@ const baseConfig = () => ({
   blacklist: { roles: [], users: [] },
   pauseRoles: [],
   channels: { whitelist: [], blacklist: [] },
+  quickLeave: { minutes: 0, banDays: 7 },
 });
 
-function fakeApi({ cfg = baseConfig(), results = [], logFails = false, detected = [], hidden = [], botCanKick = true } = {}) {
+function fakeApi({
+  cfg = baseConfig(),
+  results = [],
+  logFails = false,
+  detected = [],
+  hidden = [],
+  botCanKick = true,
+  perms: permsIn = {},
+  rolesAbove = [],
+  tempBans = 0,
+} = {}) {
+  const perms = { kick: true, ban: true, manageRoles: true, auditLog: true, rolesAboveBot: rolesAbove, ...permsIn };
   const state = { cfg: structuredClone(cfg), logs: [] };
   return {
     state,
@@ -23,9 +35,19 @@ function fakeApi({ cfg = baseConfig(), results = [], logFails = false, detected 
     saveConfig: (c) => {
       state.cfg = structuredClone(c);
     },
-    assessGuild: async () => ({ cfg: structuredClone(state.cfg), results, detectedPauseRoles: detected, botCanKick }),
+    assessGuild: async () => ({
+      cfg: structuredClone(state.cfg),
+      results,
+      detectedPauseRoles: detected,
+      botCanAct: botCanKick,
+      rolesAboveBot: rolesAbove,
+      botCanBan: perms.ban,
+      botCanViewAuditLog: perms.auditLog,
+    }),
     detectedPauseRoles: async () => detected,
     hiddenChannels: async () => hidden,
+    botPermissions: async () => perms,
+    tempBanCount: () => tempBans,
     assessMember: async (id) => results.find((r) => r.member.id === id) ?? null,
     log: async (text) => {
       if (logFails) throw new Error('Missing Access');
@@ -414,6 +436,191 @@ test('status, preview and check show warnings', async () => {
   const enable = await runCommand(sub('enable'), fakeApi({ cfg: { ...cfg, enabled: false }, results: [result('next', 'keep', { reason: 'notice' })] }));
   assert.match(enable.content, /warning DM 7 days before/);
   assert.match(enable.content, /1 member\*\* is past the limit\. They get a warning DM first .* kicked 7 days later/);
+});
+
+test('quickleave sets the window and ban length, keeps the length when omitted, turns off at 0', async () => {
+  const api = fakeApi();
+  const quick = async (options) => (await runCommand(sub('quickleave', options), api)).content;
+  const minutes = (value) => ({ name: 'minutes', type: 4, value });
+  const banDays = (value) => ({ name: 'ban-days', type: 4, value });
+
+  const on = await quick([minutes(10), banDays(3)]);
+  assert.deepEqual(api.state.cfg.quickLeave, { minutes: 10, banDays: 3 });
+  assert.match(on, /leaves within \*\*10 minutes\*\* of joining gets banned for \*\*3 days\*\*/);
+  assert.doesNotMatch(on, /⚠️/, 'has the permissions it needs');
+  assert.match(api.state.logs.at(-1), /Quick-leave bans set/);
+
+  await quick([minutes(5)]);
+  assert.deepEqual(api.state.cfg.quickLeave, { minutes: 5, banDays: 3 }, 'ban length kept');
+
+  assert.match(await quick([minutes(0)]), /\*\*off\*\*\. Bans already placed still end/);
+  assert.deepEqual(api.state.cfg.quickLeave, { minutes: 0, banDays: 3 });
+  assert.match(await quick([minutes(0)]), /already \*\*off\*\*/);
+});
+
+test('quickleave and status warn about missing Ban Members / View Audit Log', async () => {
+  const on = { ...baseConfig(), quickLeave: { minutes: 10, banDays: 7 } };
+  const reply = async (perms) =>
+    (await runCommand(sub('quickleave', [{ name: 'minutes', type: 4, value: 10 }]), fakeApi({ perms }))).content;
+  assert.match(await reply({ ban: false, auditLog: true }), /don't have the \*\*Ban Members\*\*/);
+  assert.match(await reply({ ban: true, auditLog: false }), /can't see the audit log/);
+
+  const status = await runCommand(sub('status'), fakeApi({ cfg: on, perms: { ban: false, auditLog: false }, tempBans: 2 }));
+  assert.match(status.content, /Ban Members/);
+  const field = status.embeds[0].fields.find((f) => f.name === 'Quick-leave bans');
+  assert.equal(field.value, 'Leave within 10 minutes → 7-day ban (2 banned right now)');
+
+  const off = await runCommand(sub('status'), fakeApi({ perms: { ban: false, auditLog: false } }));
+  assert.equal(off.content, undefined, 'no ban warnings while the feature is off');
+  assert.equal(off.embeds[0].fields.find((f) => f.name === 'Quick-leave bans').value, 'Off');
+});
+
+const actionCmd = (type, banDays) =>
+  sub('action', [{ name: 'type', type: 3, value: type }, ...(banDays ? [{ name: 'ban-days', type: 4, value: banDays }] : [])]);
+
+const rolesCmd = (name, role) => ({
+  guild_id: 'G',
+  member: { user: { id: 'admin' } },
+  data: {
+    name: 'autokick',
+    options: [{ type: 2, name: 'inactive-roles', options: [{ type: 1, name, options: role ? [{ name: 'role', type: 8, value: role }] : [] }] }],
+  },
+});
+
+test('action switches between kick, temp ban, soft ban and roles, with a grace period while on', async () => {
+  const api = fakeApi({ cfg: { ...baseConfig(), enabled: true, armedAt: Date.now() - DAY_MS } });
+
+  const temp = (await runCommand(actionCmd('tempban', 14), api)).content;
+  assert.deepEqual(api.state.cfg.action, { type: 'tempban', banDays: 14, give: [], take: [] });
+  assert.match(temp, /will now be \*\*banned for 14 days\*\*/);
+  assert.match(temp, /unbanned automatically/);
+  assert.ok(api.state.cfg.armedAt > Date.now() + 59 * 60_000, 'grace period after switching');
+  assert.match(api.state.logs.at(-1), /Temporary ban \(14 days\)/);
+
+  assert.match((await runCommand(actionCmd('tempban', 14), api)).content, /already \*\*Temporary ban/);
+  assert.match((await runCommand(actionCmd('softban'), api)).content, /soft-banned.*messages from the last 7 days/s);
+
+  const roles = (await runCommand(actionCmd('role'), api)).content;
+  assert.match(roles, /No roles are set yet/);
+
+  const back = (await runCommand(actionCmd('kick'), api)).content;
+  assert.match(back, /Members already marked inactive are due for the new action/);
+  assert.equal(api.state.cfg.action.type, 'kick');
+});
+
+test('action warns about a missing permission', async () => {
+  const reply = await runCommand(actionCmd('softban'), fakeApi({ perms: { ban: false } }));
+  assert.match(reply.content, /don't have the \*\*Ban Members\*\* permission/);
+  const roles = await runCommand(actionCmd('role'), fakeApi({ perms: { manageRoles: false } }));
+  assert.match(roles.content, /\*\*Manage Roles\*\*/);
+});
+
+test('inactive-roles: give, take, move between them, unset, limit, list, reset', async () => {
+  const api = fakeApi();
+  const content = async (name, role) => (await runCommand(rolesCmd(name, role), api)).content;
+
+  assert.match(await content('give', 'INACTIVE'), /will be given <@&INACTIVE>.*action is \*\*Kick\*\* right now/s);
+  assert.match(await content('take', 'MEMBER'), /<@&MEMBER> taken away\. Make sure they can still talk/);
+  assert.deepEqual([api.state.cfg.action.give, api.state.cfg.action.take], [['INACTIVE'], ['MEMBER']]);
+
+  assert.match(await content('take', 'INACTIVE'), /It was set to be given; not anymore/);
+  assert.deepEqual([api.state.cfg.action.give, api.state.cfg.action.take], [[], ['MEMBER', 'INACTIVE']]);
+
+  assert.match(await content('unset', 'INACTIVE'), /no longer given or taken/);
+  assert.match(await content('unset', 'NOPE'), /isn't given or taken/);
+  assert.match(await content('give', 'G'), /@everyone/);
+
+  for (const r of ['A', 'B', 'C', 'D', 'E']) await content('give', r);
+  assert.match(await content('give', 'F'), /at most 5 roles/);
+
+  const list = (await runCommand(rolesCmd('list'), api)).embeds[0].description;
+  assert.match(list, /\*\*Given:\*\* <@&A>, <@&B>/);
+  assert.match(list, /\*\*Taken away:\*\* <@&MEMBER>/);
+
+  assert.match(await content('reset'), /Cleared the inactive roles/);
+  assert.deepEqual([api.state.cfg.action.give, api.state.cfg.action.take], [[], []]);
+  assert.match(await content('reset'), /No inactive roles are set/);
+});
+
+test('inactive-roles warns when a role sits above the bot', async () => {
+  const api = fakeApi({ cfg: { ...baseConfig(), action: { type: 'role', give: [], take: [] } }, rolesAbove: ['STAFF'] });
+  const reply = await runCommand(rolesCmd('give', 'STAFF'), api);
+  assert.match(reply.content, /My role has to be above <@&STAFF> to give it/);
+  assert.doesNotMatch(reply.content, /right now\. Switch/, 'already the role action');
+});
+
+test('status, check and preview follow the configured action', async () => {
+  const roleCfg = { ...baseConfig(), enabled: true, action: { type: 'role', banDays: 7, give: ['INACTIVE'], take: ['MEMBER'] } };
+  const api = fakeApi({
+    cfg: roleCfg,
+    results: [
+      result('m', 'done', { kickable: true, markedAt: Date.now() - DAY_MS }),
+      result('due', 'kick', { kickable: true }),
+    ],
+  });
+  const status = await runCommand(sub('status'), api);
+  const fields = Object.fromEntries(status.embeds[0].fields.map((f) => [f.name, f.value]));
+  assert.equal(fields['Action when inactive'], 'Change roles: give <@&INACTIVE>, take <@&MEMBER>');
+  assert.equal(fields['Marked inactive (roles changed)'], '1');
+
+  const check = (await runCommand(sub('check', [{ name: 'member', type: 6, value: 'm' }]), api)).content;
+  assert.match(check, /Marked inactive <t:\d+:R> \(roles changed\)/);
+  assert.match(check, /I can change their roles/);
+
+  const preview = (await runCommand(sub('preview'), api)).embeds[0].description;
+  assert.match(preview, /1 member will be given <@&INACTIVE> and stripped of <@&MEMBER>/);
+
+  const noRoles = await runCommand(sub('status'), fakeApi({ cfg: { ...roleCfg, action: { type: 'role' } }, results: [result('x', 'keep')] }));
+  assert.match(noRoles.content, /no roles are set, so nothing happens/);
+
+  const tempban = fakeApi({ cfg: { ...baseConfig(), action: { type: 'tempban', banDays: 3 } }, results: [result('b', 'blocked', { kickable: false })] });
+  const blocked = (await runCommand(sub('check', [{ name: 'member', type: 6, value: 'b' }]), tempban)).content;
+  assert.match(blocked, /I can't ban them: they have a role above mine \(or I'm missing Ban Members\)/);
+  const unable = await runCommand(sub('status'), fakeApi({ cfg: { ...baseConfig(), action: { type: 'softban' } }, results: [result('x', 'keep')], botCanKick: false }));
+  assert.match(unable.content, /don't have the \*\*Ban Members\*\* permission, so I can't soft-ban anyone/);
+});
+
+test('whitelist and blacklist accept a pasted user ID', async () => {
+  const api = fakeApi();
+  const byId = (group, name, value, target) => ({
+    guild_id: 'G',
+    member: { user: { id: 'admin' } },
+    data: {
+      name: 'autokick',
+      options: [
+        {
+          type: 2,
+          name: group,
+          options: [
+            {
+              type: 1,
+              name,
+              options: [
+                ...(value !== undefined ? [{ name: 'user-id', type: 3, value }] : []),
+                ...(target ? [{ name: 'target', type: 9, value: target }] : []),
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  });
+  const id = '123456789012345678';
+
+  const added = await runCommand(byId('whitelist', 'add', ` ${id} `), api);
+  assert.deepEqual(api.state.cfg.whitelist.users, [id]);
+  assert.match(added.content, new RegExp(`Added <@${id}> \\(ID \`${id}\`\\) to the whitelist`));
+
+  await runCommand(byId('blacklist', 'add', `<@${id}>`), api);
+  assert.deepEqual(api.state.cfg.blacklist.users, [id], 'a pasted mention works too');
+  assert.deepEqual(api.state.cfg.whitelist.users, [], 'moved off the whitelist');
+
+  await runCommand(byId('blacklist', 'remove', id), api);
+  assert.deepEqual(api.state.cfg.blacklist.users, []);
+
+  assert.match((await runCommand(byId('whitelist', 'add', 'bob'), api)).content, /doesn't look like a user ID/);
+  assert.match((await runCommand(byId('whitelist', 'add', id, 'U1'), api)).content, /not both/);
+  assert.match((await runCommand(byId('whitelist', 'add'), api)).content, /paste a user ID/);
 });
 
 test('check explains protection', async () => {

@@ -2,10 +2,12 @@
 // Handlers only talk to the `api` object the Durable Object passes in, so they
 // can be tested without Discord or Cloudflare.
 
-import { DAY_MS, escapeMarkdown, formatDuration } from './policy.js';
+import { ACTION_DONE, actionOf, DAY_MS, escapeMarkdown, formatDuration } from './policy.js';
+import { snowflakeTime } from './discord.js';
 
 const SUB = 1;
 const GROUP = 2;
+const STRING = 3;
 const INTEGER = 4;
 const USER = 6;
 const CHANNEL = 7;
@@ -16,7 +18,8 @@ const COLOR = 0x5865f2;
 
 function listGroup(name, description) {
   const target = (verb) => [
-    { type: MENTIONABLE, name: 'target', description: `Role or member to ${verb}`, required: true },
+    { type: MENTIONABLE, name: 'target', description: `Role or member to ${verb}` },
+    { type: STRING, name: 'user-id', description: `Or the ID of a user to ${verb} (works for people not in the server)` },
   ];
   return {
     type: GROUP,
@@ -59,6 +62,15 @@ function channelListGroup(name, description) {
   };
 }
 
+const ACTION_CHOICES = [
+  { name: 'Kick (default)', value: 'kick' },
+  { name: 'Give/take roles (set them with /autokick inactive-roles)', value: 'role' },
+  { name: 'Temporary ban (unbanned automatically)', value: 'tempban' },
+  { name: 'Soft ban (kick + delete their last 7 days of messages)', value: 'softban' },
+];
+
+const roleOption = (description) => [{ type: ROLE, name: 'role', description, required: true }];
+
 export const COMMANDS = [
   {
     name: 'autokick',
@@ -97,6 +109,60 @@ export const COMMANDS = [
             required: true,
             min_value: 0,
             max_value: 364,
+          },
+        ],
+      },
+      {
+        type: SUB,
+        name: 'action',
+        description: 'Choose what happens to inactive members (default: kick)',
+        options: [
+          { type: STRING, name: 'type', description: 'What to do once someone is past the limit', required: true, choices: ACTION_CHOICES },
+          {
+            type: INTEGER,
+            name: 'ban-days',
+            description: 'For a temporary ban: how many days it lasts (default 7)',
+            min_value: 1,
+            max_value: 365,
+          },
+        ],
+      },
+      {
+        type: GROUP,
+        name: 'inactive-roles',
+        description: 'Roles given to or taken from inactive members (for the give/take roles action)',
+        options: [
+          { type: SUB, name: 'give', description: 'Give this role to members when they go inactive', options: roleOption('Role to give') },
+          {
+            type: SUB,
+            name: 'take',
+            description: 'Take this role away from members when they go inactive',
+            options: roleOption('Role to take away'),
+          },
+          { type: SUB, name: 'unset', description: 'Stop giving or taking this role', options: roleOption('Role to stop using') },
+          { type: SUB, name: 'list', description: 'Show the roles given and taken' },
+          { type: SUB, name: 'reset', description: 'Stop giving or taking any roles' },
+        ],
+      },
+      {
+        type: SUB,
+        name: 'quickleave',
+        description: 'Temporarily ban people who leave right after joining (minutes 0 turns it off)',
+        options: [
+          {
+            type: INTEGER,
+            name: 'minutes',
+            description: 'Leaving within this many minutes of joining counts (0 = off)',
+            required: true,
+            min_value: 0,
+            max_value: 1440,
+          },
+          {
+            type: INTEGER,
+            name: 'ban-days',
+            description: 'How many days the ban lasts (default 7)',
+            min_value: 1,
+            max_value: 365,
           },
         ],
       },
@@ -167,6 +233,21 @@ function tally(results) {
 
 const warnSetting = (cfg) => (cfg.warnDays ? `${plural(cfg.warnDays, 'day')} before a kick` : 'Off');
 
+const quickLeaveOf = (cfg) => cfg.quickLeave ?? { minutes: 0, banDays: 7 };
+
+function quickLeaveSetting(cfg, active) {
+  const { minutes, banDays } = quickLeaveOf(cfg);
+  if (!minutes) return 'Off';
+  return `Leave within ${plural(minutes, 'minute')} → ${banDays}-day ban (${active} banned right now)`;
+}
+
+const NO_BAN_PERMISSION =
+  "⚠️ I don't have the **Ban Members** permission, so quick-leave bans can't happen. " +
+  'Give my role Ban Members in Server Settings → Roles.';
+const NO_AUDIT_LOG =
+  "⚠️ I can't see the audit log, so people a moderator (or a verification bot) kicks soon after they join " +
+  'get banned too. Give my role **View Audit Log** so I can tell them apart.';
+
 function formatList(list) {
   const items = [...list.roles.map((id) => `<@&${id}>`), ...list.users.map((id) => `<@${id}>`)];
   if (!items.length) return 'None';
@@ -218,30 +299,111 @@ const CHANNEL_RULES =
   'A category covers every channel in it, and threads follow their channel. The most specific entry wins, ' +
   'so you can blacklist a category but whitelist one channel inside it.';
 
-const BLOCKED_HELP =
-  "they have a role above mine (or I'm missing Kick Members). Drag my role higher in Server Settings → Roles.";
+const MAX_ACTION_ROLES = 5;
+const roleMentions = (ids) => ids.map((id) => `<@&${id}>`).join(', ');
+
+/** Wording for the configured inactivity action. */
+function actionWords(cfg) {
+  const action = actionOf(cfg);
+  const done = ACTION_DONE[action.type] ?? 'kicked';
+  switch (action.type) {
+    case 'tempban':
+      return {
+        action,
+        done,
+        full: `banned for ${plural(action.banDays, 'day')}`,
+        verb: 'ban',
+        can: 'ban them',
+        perm: 'Ban Members',
+        label: `Temporary ban (${plural(action.banDays, 'day')})`,
+      };
+    case 'softban':
+      return {
+        action,
+        done,
+        full: 'soft-banned (removed, with their last 7 days of messages deleted)',
+        verb: 'soft-ban',
+        can: 'soft-ban them',
+        perm: 'Ban Members',
+        label: 'Soft ban (removes them and deletes their last 7 days of messages)',
+      };
+    case 'role': {
+      const parts = [];
+      if (action.give.length) parts.push(`given ${roleMentions(action.give)}`);
+      if (action.take.length) parts.push(`stripped of ${roleMentions(action.take)}`);
+      const label = [
+        action.give.length ? `give ${roleMentions(action.give)}` : '',
+        action.take.length ? `take ${roleMentions(action.take)}` : '',
+      ].filter(Boolean);
+      return {
+        action,
+        done,
+        full: parts.join(' and ') || 'marked inactive (no roles set yet)',
+        verb: 'change the roles of',
+        can: 'change their roles',
+        perm: 'Manage Roles',
+        label: label.length
+          ? `Change roles: ${label.join(', ')}`
+          : 'Change roles (none set yet: use `/autokick inactive-roles`)',
+      };
+    }
+    default:
+      return { action, done, full: 'kicked', verb: 'kick', can: 'kick them', perm: 'Kick Members', label: 'Kick' };
+  }
+}
+
+/** Why the bot can't carry out the action on someone. */
+function blockedHelp(cfg) {
+  const w = actionWords(cfg);
+  if (w.action.type === 'role') {
+    const roles = [...w.action.give, ...w.action.take];
+    if (!roles.length) return 'no roles are set. Use `/autokick inactive-roles give` or `take`.';
+    return `I need **Manage Roles**, and my role has to be above ${roleMentions(roles)}. Drag my role higher in Server Settings → Roles.`;
+  }
+  return `they have a role above mine (or I'm missing ${w.perm}). Drag my role higher in Server Settings → Roles.`;
+}
+
 const NOT_CONNECTED =
   "⚠️ I'm not connected to Discord right now, so new activity isn't being recorded. Open the bot's status page to see why.";
 
 /**
- * Warning when the bot can't kick most of the members it might need to (not
- * bots, the owner or whitelisted members): usually a missing Kick Members
+ * Warning when the bot can't carry out the action on most of the members it
+ * might need to (not bots, the owner or whitelisted members): usually a missing
  * permission or the bot's role sitting too low. Returns null when it's fine.
+ * `assessed` is what api.assessGuild() returned (botCanAct, rolesAboveBot).
  */
-function kickPowerWarning(results, botCanKick) {
-  const candidates = results.filter((r) => r.result.action !== 'skip' && r.result.action !== 'protected');
+function actionPowerWarning(results, assessed, cfg) {
+  const w = actionWords(cfg);
+  const candidates = results.filter((r) => !['skip', 'protected', 'done'].includes(r.result.action));
   if (!candidates.length) return null;
-  if (botCanKick === false) {
+  if (w.action.type === 'role') {
+    if (!w.action.give.length && !w.action.take.length) {
+      return (
+        '⚠️ The action is **give/take roles**, but no roles are set, so nothing happens to inactive members. ' +
+        'Use `/autokick inactive-roles give` or `take`.'
+      );
+    }
+    if (assessed.botCanAct === false) {
+      return "⚠️ I don't have the **Manage Roles** permission, so I can't change anyone's roles. Give my role Manage Roles in Server Settings → Roles.";
+    }
+    const above = assessed.rolesAboveBot ?? [];
+    if (!above.length) return null;
     return (
-      "⚠️ I don't have the **Kick Members** permission, so I can't kick anyone. " +
-      'Give my role Kick Members in Server Settings → Roles.'
+      `⚠️ I can't give or take ${roleMentions(above)}: my role has to be above ${above.length === 1 ? 'it' : 'them'}. ` +
+      'Drag my role higher in Server Settings → Roles.'
+    );
+  }
+  if (assessed.botCanAct === false) {
+    return (
+      `⚠️ I don't have the **${w.perm}** permission, so I can't ${w.verb} anyone. ` +
+      `Give my role ${w.perm} in Server Settings → Roles.`
     );
   }
   const unkickable = candidates.filter((r) => !r.result.kickable).length;
   if (unkickable * 2 <= candidates.length) return null;
   return (
-    `⚠️ I can't kick most members (${unkickable} of ${candidates.length}), probably because their roles are above mine. ` +
-    'Drag my role higher in Server Settings → Roles, above the roles of members who should be kickable.'
+    `⚠️ I can't ${w.verb} most members (${unkickable} of ${candidates.length}), probably because their roles are above mine. ` +
+    `Drag my role higher in Server Settings → Roles, above the roles of members who should be ${w.done}.`
   );
 }
 
@@ -262,28 +424,30 @@ const handlers = {
       api.saveConfig(cfg);
       await api.log(`▶️ AutoKick turned on by <@${userId}>.`).catch(() => {});
     }
-    const { results, botCanKick } = await api.assessGuild();
+    const assessed = await api.assessGuild();
+    const { results } = assessed;
     const { due, waiting, blocked } = tally(results);
-    const powerWarning = kickPowerWarning(results, botCanKick);
+    const powerWarning = actionPowerWarning(results, assessed, cfg);
+    const w = actionWords(cfg);
 
     const lines = [
       wasOn ? '✅ AutoKick was already **on**.' : '✅ **AutoKick is on.**',
-      `Members are kicked after **${cfg.days} days** without sending a message or being in a voice channel.` +
+      `Members are ${w.full} after **${cfg.days} days** without sending a message or being in a voice channel.` +
         (cfg.warnDays ? ` They get a warning DM ${plural(cfg.warnDays, 'day')} before.` : ''),
     ];
     const earliest = cfg.trackingSince + cfg.days * DAY_MS;
     if (earliest > Date.now()) {
       lines.push(
-        `• I started tracking activity ${ts(cfg.trackingSince, 'D')}, so nobody can be kicked before ${ts(earliest, 'D')}.`,
+        `• I started tracking activity ${ts(cfg.trackingSince, 'D')}, so nobody can be ${w.done} before ${ts(earliest, 'D')}.`,
       );
     }
     const past = due.length + waiting.length;
     if (past) {
       const when =
         cfg.warnDays && !due.length
-          ? `They get a warning DM first (no sooner than ${ts(firstKickAt(cfg, api))}) and are kicked ` +
+          ? `They get a warning DM first (no sooner than ${ts(firstKickAt(cfg, api))}) and are ${w.done} ` +
             `${plural(cfg.warnDays, 'day')} later if they stay inactive.`
-          : `Kicks start no sooner than ${ts(firstKickAt(cfg, api))}.`;
+          : `They'll be ${w.done} no sooner than ${ts(firstKickAt(cfg, api))}.`;
       lines.push(
         `• **${plural(past, 'member')}** ${past === 1 ? 'is' : 'are'} past the limit. ${when} ` +
           'Use `/autokick preview` to see who, or `/autokick disable` to stop.',
@@ -292,7 +456,9 @@ const handlers = {
       lines.push('• Nobody is past the limit right now.');
     }
     if (powerWarning) lines.push(powerWarning);
-    else if (blocked.length) lines.push(`⚠️ ${plural(blocked.length, 'inactive member')} can't be kicked: ${BLOCKED_HELP}`);
+    else if (blocked.length) {
+      lines.push(`⚠️ ${plural(blocked.length, 'inactive member')} can't be ${w.done}: ${blockedHelp(cfg)}`);
+    }
     if (!api.connected()) lines.push(NOT_CONNECTED);
     return { content: lines.join('\n') };
   },
@@ -310,24 +476,29 @@ const handlers = {
   },
 
   async status({ api }) {
-    const { cfg, results, detectedPauseRoles, botCanKick } = await api.assessGuild();
+    const assessed = await api.assessGuild();
+    const { cfg, results, detectedPauseRoles, botCanBan, botCanViewAuditLog } = assessed;
     const { due, waiting, blocked } = tally(results);
+    const w = actionWords(cfg);
+    const quickLeaveOn = Boolean(quickLeaveOf(cfg).minutes);
     const pastNotes = [];
     if (waiting.length) pastNotes.push(`${waiting.length} still in their warning period`);
-    if (blocked.length) pastNotes.push(`+${blocked.length} I can't kick`);
+    if (blocked.length) pastNotes.push(`+${blocked.length} I can't ${w.verb}`);
     const muted = results.filter((r) => r.result.action === 'paused').length;
-    const powerWarning = kickPowerWarning(results, botCanKick);
+    const marked = results.filter((r) => r.result.action === 'done').length;
+    const powerWarning = actionPowerWarning(results, assessed, cfg);
     const hidden = await api.hiddenChannels().catch(() => undefined);
     const now = Date.now();
     let state = 'Off';
-    if (cfg.enabled) state = cfg.armedAt > now ? `On (kicks start ${ts(cfg.armedAt)})` : 'On';
+    if (cfg.enabled) state = cfg.armedAt > now ? `On (starts ${ts(cfg.armedAt)})` : 'On';
 
     const embed = {
       title: 'AutoKick status',
       color: COLOR,
       fields: [
-        { name: 'Auto-kick', value: state, inline: true },
+        { name: 'AutoKick', value: state, inline: true },
         { name: 'Inactivity limit', value: plural(cfg.days, 'day'), inline: true },
+        { name: 'Action when inactive', value: w.label },
         { name: 'Warning DM', value: warnSetting(cfg), inline: true },
         { name: 'Log channel', value: cfg.logChannelId ? `<#${cfg.logChannelId}>` : 'Not set', inline: true },
         { name: 'Tracking since', value: ts(cfg.trackingSince, 'D'), inline: true },
@@ -338,6 +509,10 @@ const handlers = {
           inline: true,
         },
         { name: 'Muted right now (clock paused)', value: String(muted), inline: true },
+        ...(w.action.type === 'role' || marked
+          ? [{ name: 'Marked inactive (roles changed)', value: String(marked), inline: true }]
+          : []),
+        { name: 'Quick-leave bans', value: quickLeaveSetting(cfg, api.tempBanCount()) },
         { name: 'Whitelist (never kicked)', value: formatList(cfg.whitelist) },
         { name: 'Blacklist (kickable even with a whitelisted role)', value: formatList(cfg.blacklist) },
         { name: 'Pause roles (plus anyone timed out)', value: formatPauseRoles(cfg, detectedPauseRoles) },
@@ -353,6 +528,8 @@ const handlers = {
     const warnings = [];
     if (!api.connected()) warnings.push(NOT_CONNECTED);
     if (powerWarning) warnings.push(powerWarning);
+    if (quickLeaveOn && botCanBan === false) warnings.push(NO_BAN_PERMISSION);
+    else if (quickLeaveOn && botCanViewAuditLog === false) warnings.push(NO_AUDIT_LOG);
     if (hidden?.length) {
       warnings.push(
         `⚠️ I can't see ${plural(hidden.length, 'channel')}, so activity there isn't tracked and people ` +
@@ -365,6 +542,7 @@ const handlers = {
   async preview({ api }) {
     const { cfg, results } = await api.assessGuild();
     const { due, waiting, blocked } = tally(results);
+    const w = actionWords(cfg);
     if (!due.length && !waiting.length && !blocked.length) {
       return { content: `Nobody has been inactive for ${plural(cfg.days, 'day')} or more. ✨` };
     }
@@ -378,15 +556,15 @@ const handlers = {
     const noticeLine = (entry) =>
       line(entry) +
       (entry.result.warning
-        ? `. Warned ${ts(entry.result.warning.at)}, kicked ${ts(Date.now() + entry.result.remainingMs)}`
+        ? `. Warned ${ts(entry.result.warning.at)}, ${w.done} ${ts(Date.now() + entry.result.remainingMs)}`
         : '. Not warned yet');
 
     const parts = [];
     if (due.length) {
       parts.push(
         cfg.enabled
-          ? `**${plural(due.length, 'member')} will be kicked** (no sooner than ${ts(firstKickAt(cfg, api))}):`
-          : `**${plural(due.length, 'member')} would be kicked**. AutoKick is off, so nothing happens until \`/autokick enable\`.`,
+          ? `**${plural(due.length, 'member')} will be ${w.full}** (no sooner than ${ts(firstKickAt(cfg, api))}):`
+          : `**${plural(due.length, 'member')} would be ${w.full}**. AutoKick is off, so nothing happens until \`/autokick enable\`.`,
       );
       parts.push(...due.map(line));
     }
@@ -394,13 +572,13 @@ const handlers = {
       if (parts.length) parts.push('');
       parts.push(
         `**${plural(waiting.length, 'member')} past the limit ${waiting.length === 1 ? 'is' : 'are'} in their warning period** ` +
-          "(kicked once it ends, if they're still inactive):",
+          `(${w.done} once it ends, if they're still inactive):`,
       );
       parts.push(...waiting.map(noticeLine));
     }
     if (blocked.length) {
       if (parts.length) parts.push('');
-      parts.push(`**${plural(blocked.length, 'member')} past the limit that I can't kick**: ${BLOCKED_HELP}`);
+      parts.push(`**${plural(blocked.length, 'member')} past the limit that I can't ${w.verb}**: ${blockedHelp(cfg)}`);
       parts.push(...blocked.map(line));
     }
 
@@ -420,6 +598,7 @@ const handlers = {
     if (!found) return { content: `<@${opts.member}> isn't in this server.` };
     const { member, result } = found;
     const cfg = api.getConfig();
+    const w = actionWords(cfg);
 
     const lines = [`**${escapeMarkdown(member.username)}** (<@${member.id}>)`];
     if (result.recorded) {
@@ -441,27 +620,30 @@ const handlers = {
       case 'kick':
         lines.push(
           cfg.enabled
-            ? `🔴 Past the limit. Will be kicked at the next check (${ts(firstKickAt(cfg, api))}).`
+            ? `🔴 Past the limit. Will be ${w.full} at the next check (${ts(firstKickAt(cfg, api))}).`
             : '🔴 Past the limit, but AutoKick is off.',
         );
         break;
       case 'blocked':
-        lines.push(`🟠 Past the limit, but I can't kick them: ${BLOCKED_HELP}`);
+        lines.push(`🟠 Past the limit, but I can't ${w.can}: ${blockedHelp(cfg)}`);
+        break;
+      case 'done':
+        lines.push(`🏷️ Marked inactive ${ts(result.markedAt)} (roles changed). They get their roles back once they're active again.`);
         break;
       case 'keep': {
         const kickAt = Date.now() + result.remainingMs;
         const past = result.reason === 'notice' ? 'Past the limit. ' : '';
         if (result.warning) {
           const missed = result.warning.delivered ? '' : " (their DMs are closed, so it didn't reach them)";
-          lines.push(`🟡 ${past}Warned ${ts(result.warning.at)}${missed}. Will be kicked ${ts(kickAt)} if they stay inactive.`);
+          lines.push(`🟡 ${past}Warned ${ts(result.warning.at)}${missed}. Will be ${w.done} ${ts(kickAt)} if they stay inactive.`);
         } else if (result.warnNow) {
           const send = cfg.enabled
             ? `Gets a warning DM at the next check (${ts(firstKickAt(cfg, api))})`
             : 'Would get a warning DM now, but AutoKick is off';
-          lines.push(`🟡 ${past}${send}, and can't be kicked until ${plural(cfg.warnDays, 'day')} after it.`);
+          lines.push(`🟡 ${past}${send}, and can't be ${w.done} until ${plural(cfg.warnDays, 'day')} after it.`);
         } else {
           const warnFirst = cfg.warnDays ? ` They'd get a warning DM ${plural(cfg.warnDays, 'day')} before.` : '';
-          lines.push(`🟢 Fine for now. Would be kicked ${ts(kickAt)} if they stay inactive.${warnFirst}`);
+          lines.push(`🟢 Fine for now. Would be ${w.done} ${ts(kickAt)} if they stay inactive.${warnFirst}`);
         }
         break;
       }
@@ -476,14 +658,14 @@ const handlers = {
         lines.push(result.reason === 'bot' ? '🤖 Bots are never kicked.' : '👑 The server owner is never kicked.');
     }
 
-    // Admin-only details: blacklist and whether the bot could kick them at all.
+    // Admin-only details: blacklist and whether the bot could act on them at all.
     if (result.listed?.reason === 'blacklisted member') {
       lines.push("📛 Blacklisted (as a member), so whitelisted roles don't protect them.");
     } else if (result.listed?.reason === 'blacklisted role') {
       lines.push(`📛 Blacklisted through the role <@&${result.listed.roleId}>, so whitelisted roles don't protect them.`);
     }
     if (result.action !== 'skip' && result.action !== 'blocked') {
-      lines.push(result.kickable ? '👢 I can kick them.' : `🚫 I can't kick them: ${BLOCKED_HELP}`);
+      lines.push(result.kickable ? `👢 I can ${w.can}.` : `🚫 I can't ${w.can}: ${blockedHelp(cfg)}`);
     }
     return { content: lines.join('\n') };
   },
@@ -508,11 +690,12 @@ const handlers = {
 
     const { due, waiting } = tally((await api.assessGuild()).results);
     const past = due.length + waiting.length;
+    const w = actionWords(cfg);
     const after = cfg.enabled
-      ? ` Kicks start no sooner than ${ts(firstKickAt(cfg, api))}.`
-      : ' AutoKick is off, so nobody will be kicked until `/autokick enable`.';
+      ? ` Nobody is ${w.done} before ${ts(firstKickAt(cfg, api))}.`
+      : ` AutoKick is off, so nobody will be ${w.done} until \`/autokick enable\`.`;
     const lines = [
-      `✅ Members will now be kicked after **${plural(cfg.days, 'day')}** of inactivity. ` +
+      `✅ Members will now be ${w.full} after **${plural(cfg.days, 'day')}** of inactivity. ` +
         `${plural(past, 'member')} ${past === 1 ? 'is' : 'are'} past that right now.${after}`,
     ];
     if (droppedWarn) {
@@ -548,20 +731,107 @@ const handlers = {
       )
       .catch(() => {});
 
+    const w = actionWords(cfg);
     if (!days) {
       return {
         content:
-          '✅ Warning DMs are **off**. Members only get a DM when they are kicked. ' +
-          "Anyone already warned keeps the date they were given, so they won't be kicked before it.",
+          `✅ Warning DMs are **off**. Members only get a DM when they are ${w.done}. ` +
+          `Anyone already warned keeps the date they were given, so they won't be ${w.done} before it.`,
       };
     }
     const lines = [
-      `✅ Members now get a DM **${plural(days, 'day')}** before they're kicked, and can't be kicked until ` +
+      `✅ Members now get a DM **${plural(days, 'day')}** before they're ${w.done}, and can't be ${w.done} until ` +
         `${plural(days, 'day')} after it, even if they're already past the limit.`,
       'If they send a message or join voice before then, their clock resets and the warning no longer counts.',
-      "Members with DMs closed can't receive it; they're still kicked on the same schedule.",
+      `Members with DMs closed can't receive it; they're still ${w.done} on the same schedule.`,
     ];
     if (!cfg.enabled) lines.push('AutoKick is off, so no warnings go out until `/autokick enable`.');
+    return { content: lines.join('\n') };
+  },
+
+  async quickleave({ api, opts, userId }) {
+    const cfg = api.getConfig();
+    const previous = quickLeaveOf(cfg);
+    const minutes = opts.minutes;
+    const banDays = opts['ban-days'] ?? previous.banDays;
+
+    if (!minutes) {
+      if (!previous.minutes) return { content: 'Quick-leave bans are already **off**.' };
+      cfg.quickLeave = { ...previous, minutes: 0 };
+      api.saveConfig(cfg);
+      await api.log(`⚙️ Quick-leave bans turned off by <@${userId}>.`).catch(() => {});
+      return { content: '✅ Quick-leave bans are **off**. Bans already placed still end on their own date.' };
+    }
+
+    cfg.quickLeave = { minutes, banDays };
+    api.saveConfig(cfg);
+    await api
+      .log(
+        `⚙️ Quick-leave bans set by <@${userId}>: leaving within ${plural(minutes, 'minute')} of joining ` +
+          `means a ${banDays}-day ban.`,
+      )
+      .catch(() => {});
+
+    const lines = [
+      `✅ Anyone who leaves within **${plural(minutes, 'minute')}** of joining gets banned for **${plural(banDays, 'day')}**, ` +
+        "then unbanned automatically. This works whether or not inactivity kicks are on.",
+      'Bots and whitelisted members are never banned. Bans show up in Server Settings → Bans with the date they end; ' +
+        'unban someone there to let them back early.',
+    ];
+    const perms = await api.botPermissions().catch(() => null);
+    if (perms && !perms.ban) lines.push(NO_BAN_PERMISSION);
+    else if (perms && !perms.auditLog) lines.push(NO_AUDIT_LOG);
+    return { content: lines.join('\n') };
+  },
+
+  async action({ api, opts, userId }) {
+    const cfg = api.getConfig();
+    const previous = actionOf(cfg);
+    const type = opts.type;
+    const banDays = opts['ban-days'] ?? previous.banDays;
+    if (type === previous.type && banDays === previous.banDays) {
+      return { content: `The action is already **${actionWords(cfg).label}**.` };
+    }
+    cfg.action = { ...previous, type, banDays };
+    // A different action can suddenly apply to everyone already past the limit
+    // (including members marked by the role action): same one-hour window as enabling.
+    const changedType = type !== previous.type;
+    if (cfg.enabled && changedType) cfg.armedAt = Math.max(cfg.armedAt ?? 0, Date.now() + api.enableGraceMs);
+    api.saveConfig(cfg);
+    const w = actionWords(cfg);
+    await api.log(`⚙️ Inactivity action changed to **${w.label}** by <@${userId}>.`).catch(() => {});
+
+    const lines = [`✅ Inactive members will now be **${w.full}** after ${plural(cfg.days, 'day')} without activity.`];
+    if (type === 'tempban') lines.push("They're unbanned automatically when it ends, and can rejoin with an invite.");
+    if (type === 'softban') {
+      lines.push(
+        'A soft ban bans and immediately unbans them: they leave the server, their messages from the last 7 days ' +
+          'are deleted, and they can rejoin with an invite.',
+      );
+    }
+    if (type === 'role') {
+      lines.push(
+        w.action.give.length || w.action.take.length
+          ? "Members stay in the server. Their roles are changed back as soon as they're active again."
+          : '⚠️ No roles are set yet, so nothing happens to inactive members until you add some with ' +
+              '`/autokick inactive-roles give` or `take`.',
+      );
+    }
+    if (previous.type === 'role' && changedType) {
+      lines.push("Members already marked inactive are due for the new action too (their roles still go back if they're active).");
+    }
+
+    const perms = await api.botPermissions().catch(() => null);
+    if (perms) {
+      const missing = { kick: !perms.kick, tempban: !perms.ban, softban: !perms.ban, role: !perms.manageRoles }[type];
+      if (missing) lines.push(`⚠️ I don't have the **${w.perm}** permission yet. Give my role ${w.perm} in Server Settings → Roles.`);
+      else if (type === 'role' && perms.rolesAboveBot.length) {
+        lines.push(`⚠️ My role has to be above ${roleMentions(perms.rolesAboveBot)} to give or take it. Drag my role higher in Server Settings → Roles.`);
+      }
+    }
+    if (cfg.enabled && changedType) {
+      lines.push(`To give you time to check \`/autokick preview\`, nothing happens before ${ts(cfg.armedAt)}.`);
+    }
     return { content: lines.join('\n') };
   },
 
@@ -627,13 +897,24 @@ async function editList({ api, opts, interaction, userId }, listName, action) {
     return { content: `✅ Cleared the ${listName} (${count} ${count === 1 ? 'entry' : 'entries'}: ${cleared}).${grace}` };
   }
 
-  const id = opts.target;
-  const isRole = Boolean(interaction.data.resolved?.roles?.[id]);
-  if (isRole && id === interaction.guild_id) {
+  // Either a picked role/member, or a pasted user ID (for someone who isn't in the server).
+  const rawId = opts['user-id']?.trim();
+  if (opts.target && rawId) return { content: '❌ Pick a role or member, **or** paste a user ID, not both.' };
+  if (!opts.target && !rawId) return { content: '❌ Pick a role or member, or paste a user ID.' };
+  const id = opts.target ?? rawId.replace(/^<@!?(\d+)>$/, '$1');
+  if (!opts.target && !/^\d{17,20}$/.test(id)) {
+    return {
+      content:
+        "❌ That doesn't look like a user ID. In Discord, turn on Developer Mode (User Settings → Advanced), " +
+        'then right-click the user and choose **Copy User ID**.',
+    };
+  }
+  const isRole = Boolean(opts.target && interaction.data.resolved?.roles?.[id]);
+  if (id === interaction.guild_id) {
     return { content: "@everyone can't go on a list. To stop all kicks, use `/autokick disable`." };
   }
   const kind = isRole ? 'roles' : 'users';
-  const mention = isRole ? `<@&${id}>` : `<@${id}>`;
+  const mention = isRole ? `<@&${id}>` : opts.target ? `<@${id}>` : `<@${id}> (ID \`${id}\`)`;
   const other = listName === 'whitelist' ? 'blacklist' : 'whitelist';
   const list = cfg[listName][kind];
 
@@ -704,6 +985,73 @@ async function editPauseRoles({ api, opts, interaction, userId }, action) {
   return { content: `✅ ${mention} is no longer a pause role.${still}` };
 }
 
+/** /autokick inactive-roles: which roles the role action gives and takes. */
+async function editInactiveRoles({ api, opts, interaction, userId }, sub) {
+  const cfg = api.getConfig();
+  const action = actionOf(cfg);
+  const notRoleAction =
+    action.type === 'role'
+      ? ''
+      : `\nThe action is **${actionWords(cfg).label}** right now. Switch with \`/autokick action type:Give/take roles\`.`;
+
+  if (sub === 'list') {
+    return {
+      embeds: [
+        {
+          title: 'Inactive roles',
+          color: COLOR,
+          description:
+            `**Given:** ${action.give.length ? roleMentions(action.give) : 'None'}\n` +
+            `**Taken away:** ${action.take.length ? roleMentions(action.take) : 'None'}\n\n` +
+            "Used when the action is give/take roles. Changes are undone as soon as the member is active again." +
+            notRoleAction,
+        },
+      ],
+    };
+  }
+  if (sub === 'reset') {
+    if (!action.give.length && !action.take.length) return { content: 'No inactive roles are set.' };
+    cfg.action = { ...action, give: [], take: [] };
+    api.saveConfig(cfg);
+    await api.log(`⚙️ <@${userId}> cleared the inactive roles.`).catch(() => {});
+    return { content: "✅ Cleared the inactive roles. Members already marked still get their roles back once they're active." };
+  }
+
+  const id = opts.role;
+  const mention = `<@&${id}>`;
+  if (id === interaction.guild_id) return { content: "@everyone can't be given or taken away." };
+
+  if (sub === 'unset') {
+    if (!action.give.includes(id) && !action.take.includes(id)) return { content: `${mention} isn't given or taken.` };
+    cfg.action = { ...action, give: action.give.filter((x) => x !== id), take: action.take.filter((x) => x !== id) };
+    api.saveConfig(cfg);
+    await api.log(`⚙️ <@${userId}> stopped using ${mention} as an inactive role.`).catch(() => {});
+    return { content: `✅ ${mention} is no longer given or taken. Members already marked still get their roles put back once they're active.` };
+  }
+
+  const list = sub === 'give' ? 'give' : 'take';
+  const other = list === 'give' ? 'take' : 'give';
+  if (action[list].includes(id)) return { content: `${mention} is already ${list === 'give' ? 'given' : 'taken away'}.` };
+  if (action[list].length >= MAX_ACTION_ROLES) {
+    return { content: `❌ You can ${list} at most ${MAX_ACTION_ROLES} roles. Remove one with \`/autokick inactive-roles unset\` first.` };
+  }
+  const moved = action[other].includes(id);
+  cfg.action = { ...action, [list]: [...action[list], id], [other]: action[other].filter((x) => x !== id) };
+  api.saveConfig(cfg);
+  await api.log(`⚙️ <@${userId}> set ${mention} to be ${list === 'give' ? 'given to' : 'taken from'} inactive members.`).catch(() => {});
+
+  const lines = [
+    list === 'give'
+      ? `✅ Inactive members will be given ${mention}.`
+      : `✅ Inactive members will have ${mention} taken away. Make sure they can still talk or join voice somewhere, or they can't become active again.`,
+  ];
+  if (moved) lines.push(`(It was set to be ${other === 'give' ? 'given' : 'taken away'}; not anymore.)`);
+  const perms = await api.botPermissions().catch(() => null);
+  if (perms && !perms.manageRoles) lines.push("⚠️ I don't have the **Manage Roles** permission yet. Give my role Manage Roles in Server Settings → Roles.");
+  else if (perms?.rolesAboveBot.includes(id)) lines.push(`⚠️ My role has to be above ${mention} to ${list} it. Drag my role higher in Server Settings → Roles.`);
+  return { content: lines.join('\n') + notRoleAction };
+}
+
 const CHANNEL_LISTS = { 'channel-whitelist': 'whitelist', 'channel-blacklist': 'blacklist' };
 
 async function editChannelList({ api, opts, interaction, userId }, group, action) {
@@ -768,9 +1116,6 @@ async function editChannelList({ api, opts, interaction, userId }, group, action
   return { content: `✅ Removed ${where} from the ${label}.${nowEmpty}` };
 }
 
-/** Discord IDs encode their creation time. */
-const snowflakeTime = (id) => Number((BigInt(id) >> 22n) + 1420070400000n);
-
 function ping(interaction, api) {
   const lines = ['🏓 **Pong!**'];
   if (interaction.id) {
@@ -819,6 +1164,7 @@ export async function runCommand(interaction, api) {
     opts: Object.fromEntries((sub?.options ?? []).map((o) => [o.name, o.value])),
   };
   if (group === 'pause') return editPauseRoles(ctx, sub.name);
+  if (group === 'inactive-roles') return editInactiveRoles(ctx, sub.name);
   if (Object.hasOwn(CHANNEL_LISTS, group ?? '')) return editChannelList(ctx, group, sub.name);
   if (group) return editList(ctx, group, sub.name);
   const handler = handlers[sub.name];

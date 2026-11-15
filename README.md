@@ -14,10 +14,25 @@ It isn't fair to count time against someone who wasn't allowed to talk. While a 
 
 Pause roles are any role named like "Muted" or "Mute" (picked up automatically), plus any roles you add with `/autokick pause add`, such as an "On Break" role.
 
+## What happens to inactive members
+
+Choose with `/autokick action type:`. Kicking is the default.
+
+| Action | What it does | Bot needs |
+| --- | --- | --- |
+| **Kick** | Removes them. They can rejoin with an invite. | Kick Members |
+| **Give/take roles** | They stay, but get the roles you set with `/autokick inactive-roles give` and lose the ones set with `take` (up to 5 each), for example give "Inactive" and take "Member". As soon as they're active again the bot undoes exactly what it changed. | Manage Roles, and its role above every role it gives or takes |
+| **Temporary ban** | Bans them for `ban-days` (default 7), then unbans them automatically. | Ban Members |
+| **Soft ban** | Bans and immediately unbans them: they're removed, and their messages from the last 7 days are deleted. They can rejoin with an invite. | Ban Members |
+
+With the role action, make sure inactive members can still send a message or join voice somewhere (a "welcome back" channel, say). Otherwise they can't become active again to get their roles back.
+
+Members get a DM explaining what happened (if their DMs are open), and everything is posted in the log channel. Switching the action while AutoKick is on starts a new one-hour grace period.
+
 ## Who is never kicked
 
 - Bots and the server owner.
-- Anyone whose highest role is above the bot's role (Discord won't allow it).
+- Anyone whose highest role is above the bot's role (Discord won't allow it). This doesn't apply to the role action, which only needs the bot's role above the roles it gives or takes.
 - Whitelisted members and roles (see [Whitelist and blacklist](#whitelist-and-blacklist)).
 
 ## Safety features
@@ -28,6 +43,17 @@ Pause roles are any role named like "Muted" or "Mute" (picked up automatically),
 - **Bot downtime isn't held against anyone.** If the bot is offline for a while, that time isn't counted as inactivity.
 - Kicked members get a DM (if their DMs are open) saying why and that they can rejoin.
 - **Optional warning DM** before a kick: `/autokick warn days:7` messages members 7 days before they'd be kicked (`days:0` turns it off; it's off by default). Nobody is kicked until the date their warning gave them, even if they were already past the limit when warnings were turned on. One warning per stretch of inactivity: being active again resets it. Members with DMs closed are still kicked on the same schedule. Warnings go out at most 10 per minute per server, and are posted in the log channel.
+
+## Quick-leave bans
+
+Optional, off by default, and separate from inactivity kicks (it works even while `/autokick` is disabled). `/autokick quickleave minutes:10 ban-days:7` bans anyone who leaves within 10 minutes of joining for 7 days, then unbans them automatically. `minutes:0` turns it off.
+
+- It stops the same people from bouncing in and out again. It can't stop someone's first join and leave, because they're already gone by then.
+- Never banned: bots and whitelisted members. Someone who rejoins before the ban goes out (within about a minute) isn't banned.
+- People kicked by a moderator or another bot (a verification bot, say) aren't banned, as long as the bot has **View Audit Log** so it can tell a kick from a leave.
+- The bot needs **Ban Members**. `/autokick status` warns if either permission is missing.
+- Bans show up in Server Settings → Bans with the date they end. Unban someone there to let them back early. If a moderator replaces the ban with their own, the bot leaves it in place.
+- Bans and unbans are posted in the log channel.
 
 ## Commands
 
@@ -41,10 +67,13 @@ All commands are under `/autokick`. By default only members with **Manage Server
 | `/autokick preview` | Who would be kicked right now |
 | `/autokick check member:` | One member's last activity and status |
 | `/autokick days days:` | Change the limit (1–365 days, default 30) |
+| `/autokick action type: [ban-days:]` | What happens to inactive members: kick (default), give/take roles, temporary ban, or soft ban |
+| `/autokick inactive-roles give/take/unset/list/reset` | Roles given to or taken from inactive members (for the give/take roles action) |
 | `/autokick warn days:` | DM members this many days before they're kicked (0 = off, the default) |
-| `/autokick logchannel [channel:]` | Post kicks, warnings and setting changes in a channel (leave empty to turn off) |
-| `/autokick whitelist add/remove/list/reset` | Roles or members that are never kicked |
-| `/autokick blacklist add/remove/list/reset` | Roles or members that can be kicked even if they have a whitelisted role |
+| `/autokick quickleave minutes: [ban-days:]` | Temporarily ban people who leave within that many minutes of joining (0 = off, the default; ban 7 days unless set) |
+| `/autokick logchannel [channel:]` | Post kicks, warnings, bans and setting changes in a channel (leave empty to turn off) |
+| `/autokick whitelist add/remove/list/reset` | Roles or members that are never kicked. `add`/`remove` take a role or member, or a `user-id` for someone not in the server |
+| `/autokick blacklist add/remove/list/reset` | Roles or members that can be kicked even if they have a whitelisted role (same options as the whitelist) |
 | `/autokick channel-whitelist add/remove/list/reset` | If set, only activity in these channels/categories counts |
 | `/autokick channel-blacklist add/remove/list/reset` | Activity in these channels/categories doesn't count |
 | `/autokick pause add/remove/list` | Roles that pause a member's clock while they have them (timeouts always do) |

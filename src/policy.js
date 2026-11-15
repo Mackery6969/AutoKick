@@ -91,6 +91,19 @@ export function observedInactiveMs(lastActive, now, excluded = []) {
   return Math.max(0, ms);
 }
 
+/**
+ * What happens to a member once they're past the limit:
+ *   type 'kick' (default), 'role' (give `give` roles, take `take` roles; undone when
+ *   they're active again), 'tempban' (banned for `banDays`, then unbanned), or
+ *   'softban' (banned and unbanned right away, which deletes their recent messages).
+ */
+export function actionOf(cfg) {
+  return { type: 'kick', banDays: 7, give: [], take: [], ...(cfg?.action ?? {}) };
+}
+
+/** "Will be ___": a short word for each action. */
+export const ACTION_DONE = { kick: 'kicked', tempban: 'banned', softban: 'soft-banned', role: 'marked inactive' };
+
 /** How long before a kick members get a warning DM, or 0 when warnings are off. */
 export function warningMs(cfg) {
   const days = cfg.warnDays ?? 0;
@@ -99,13 +112,17 @@ export function warningMs(cfg) {
 
 /**
  * Assess one member. `member` is a plain snapshot:
- *   { id, bot, isOwner, kickable, roleIds, joinedTimestamp, pauses?, pausedBy?, warning? }
+ *   { id, bot, isOwner, kickable, roleIds, joinedTimestamp, pauses?, pausedBy?, warning?, marked? }
+ * `kickable` means the bot is able to carry out the configured action on them.
  * `pauses` are this member's muted periods as [start, end]; `pausedBy` is set
  * ('timeout' or 'role') when they are muted right now. `warning` is the last
- * warning DM sent to them: { at, kickAfter, delivered }.
+ * warning DM sent to them: { at, kickAfter, delivered }. `marked` is set when
+ * the role action was applied to them: { at }.
  *
  * Returns an object whose `action` is one of:
- *   'kick'      - past the limit (and any warning period) and the bot is able to kick them
+ *   'kick'      - past the limit (and any warning period): carry out the action now
+ *                 (kick, roles, temp ban or soft ban; the name is kept from when kicking was the only one)
+ *   'done'      - the role action was already applied and they haven't been active since
  *   'blocked'   - past the limit, but the bot's role is too low / lacks permission
  *   'keep'      - still within the limit (reason 'active'), or past it but still
  *                 inside the notice their warning DM gave them (reason 'notice')
@@ -140,6 +157,10 @@ export function assess(member, cfg, { now, downtime }) {
   const listed = { ...base, listed: list.reason ? { reason: list.reason, roleId: list.roleId ?? null } : null };
   if (list.protected) {
     return { ...listed, action: 'protected', reason: list.reason, roleId: list.roleId };
+  }
+  // Role action already applied, and not active since: nothing more to do until they are.
+  if (actionOf(cfg).type === 'role' && member.marked && member.marked.at >= lastActive) {
+    return { ...listed, action: 'done', markedAt: member.marked.at };
   }
 
   // With warnings on, nobody is kicked until the date their warning DM gave them.
@@ -191,6 +212,19 @@ export function pauseChanges(rows, member, pauseRoles, now) {
   return ops;
 }
 
+/**
+ * How long to ban someone who just left, or 0 for no ban. Leaving within
+ * `quickLeave.minutes` of joining counts (0 = feature off). Whitelisted
+ * members are never banned.
+ */
+export function quickLeaveBanMs(cfg, { userId, joinedAt, leftAt }) {
+  const { minutes = 0, banDays = 7 } = cfg?.quickLeave ?? {};
+  if (!minutes || joinedAt == null) return 0;
+  if (cfg.whitelist?.users?.includes(userId)) return 0;
+  if (leftAt - joinedAt > minutes * 60_000) return 0;
+  return banDays * DAY_MS;
+}
+
 export const escapeMarkdown = (text) => String(text).replace(/[\\*_`~|>]/g, '\\$&');
 
 export function formatDuration(ms) {
@@ -199,4 +233,13 @@ export function formatDuration(ms) {
   const hours = Math.floor(ms / (60 * 60 * 1000));
   if (hours >= 1) return `${hours} hour${hours === 1 ? '' : 's'}`;
   return 'less than an hour';
+}
+
+/** Like formatDuration, but down to seconds and minutes (for "left 2 minutes after joining"). */
+export function formatShortDuration(ms) {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  if (seconds < 60) return `${seconds} second${seconds === 1 ? '' : 's'}`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+  return formatDuration(ms);
 }

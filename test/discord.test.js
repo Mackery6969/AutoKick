@@ -2,7 +2,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   botHasKickPermission,
+  canBan,
   canKick,
+  canManageRoles,
+  PERM_BAN_MEMBERS,
+  PERM_MANAGE_ROLES,
+  rolesAboveBot,
   canViewChannel,
   PERM_VIEW_CHANNEL,
   editOriginalReply,
@@ -93,6 +98,32 @@ test('canKick needs Kick Members or Administrator', () => {
   const admin = { id: 'bot', roleIds: ['adminrole'] };
   assert.equal(canKick(meta, admin, { id: 'a', roleIds: ['member'] }), true);
   assert.equal(botHasKickPermission(meta, admin), true);
+});
+
+test('canBan needs Ban Members; canManageRoles needs Manage Roles and roles below the bot', () => {
+  assert.equal(canBan(meta, bot, { id: 'a', roleIds: [] }), false, 'bot role only has Kick Members');
+  const banner = { id: 'bot', roleIds: ['botrole', 'banrole'] };
+  const m = guildMeta({
+    id: 'G',
+    owner_id: 'owner',
+    roles: [
+      { id: 'G', position: 0, permissions: '0' },
+      { id: 'botrole', position: 5, permissions: String(PERM_MANAGE_ROLES) },
+      { id: 'banrole', position: 1, permissions: String(PERM_BAN_MEMBERS) },
+      { id: 'inactive', position: 2, permissions: '0' },
+      { id: 'mod', position: 8, permissions: '0' },
+    ],
+  });
+  assert.equal(canBan(m, banner, { id: 'a', roleIds: ['inactive'] }), true);
+  assert.equal(canBan(m, banner, { id: 'a', roleIds: ['mod'] }), false, 'role above the bot');
+
+  const roleBot = { id: 'bot', roleIds: ['botrole'] };
+  assert.equal(canManageRoles(m, roleBot, ['inactive']), true);
+  assert.equal(canManageRoles(m, roleBot, ['inactive', 'mod']), false, 'one role above the bot');
+  assert.equal(canManageRoles(m, roleBot, ['gone']), false, 'deleted role');
+  assert.equal(canManageRoles(m, roleBot, []), false, 'no roles set');
+  assert.equal(canManageRoles(m, { id: 'bot', roleIds: ['banrole'] }, ['G']), false, 'no Manage Roles');
+  assert.deepEqual(rolesAboveBot(m, roleBot, ['inactive', 'mod', 'gone']), ['mod', 'gone']);
 });
 
 test('canViewChannel follows Discord permission overwrites', () => {

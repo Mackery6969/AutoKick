@@ -144,19 +144,37 @@ function highestPosition(meta, roleIds) {
   return highest;
 }
 
+export const PERM_BAN_MEMBERS = 1n << 2n;
+export const PERM_VIEW_AUDIT_LOG = 1n << 7n;
+export const PERM_MANAGE_ROLES = 1n << 28n;
+
 /**
- * Can the bot kick `target`? Same rules Discord enforces: the bot needs
- * Kick Members (or Administrator), can't kick the owner, and its highest role
+ * Can the bot kick (or ban) `target`? Same rules Discord enforces: the bot needs
+ * the permission (or Administrator), can't touch the owner, and its highest role
  * must sit above the target's highest role.
  */
-export function canKick(meta, botMember, target) {
+export function canKick(meta, botMember, target, perm = PERM_KICK_MEMBERS) {
   if (!botMember || target.id === meta.ownerId || target.id === botMember.id) return false;
-
-  let perms = meta.roles.get(meta.id)?.permissions ?? 0n; // @everyone role shares the guild's id
-  for (const id of botMember.roleIds) perms |= meta.roles.get(id)?.permissions ?? 0n;
-  if (!(perms & PERM_ADMINISTRATOR) && !(perms & PERM_KICK_MEMBERS)) return false;
-
+  if (!botHasPermission(meta, botMember, perm)) return false;
   return highestPosition(meta, botMember.roleIds) > highestPosition(meta, target.roleIds);
+}
+
+export const canBan = (meta, botMember, target) => canKick(meta, botMember, target, PERM_BAN_MEMBERS);
+
+/**
+ * Can the bot give and take these roles? It needs Manage Roles, and every role
+ * must exist and sit below the bot's highest role. (The member's own roles don't matter.)
+ */
+export function canManageRoles(meta, botMember, roleIds) {
+  if (!botMember || !roleIds.length || !botHasPermission(meta, botMember, PERM_MANAGE_ROLES)) return false;
+  const top = highestPosition(meta, botMember.roleIds);
+  return roleIds.every((id) => meta.roles.has(id) && meta.roles.get(id).position < top);
+}
+
+/** Roles the bot can't give or take because they're at or above its own highest role (or deleted). */
+export function rolesAboveBot(meta, botMember, roleIds) {
+  const top = botMember ? highestPosition(meta, botMember.roleIds) : 0;
+  return roleIds.filter((id) => !meta.roles.has(id) || meta.roles.get(id).position >= top);
 }
 
 export const PERM_VIEW_CHANNEL = 1n << 10n;
@@ -193,10 +211,18 @@ export function canViewChannel(meta, botMember, channel) {
   return Boolean(perms & PERM_VIEW_CHANNEL);
 }
 
-/** True if the bot has Kick Members at all (ignores role order). */
-export function botHasKickPermission(meta, botMember) {
+/** True if the bot has this server-wide permission (or Administrator). Ignores role order. */
+export function botHasPermission(meta, botMember, perm) {
   if (!botMember) return false;
   let perms = meta.roles.get(meta.id)?.permissions ?? 0n;
   for (const id of botMember.roleIds) perms |= meta.roles.get(id)?.permissions ?? 0n;
-  return Boolean(perms & PERM_ADMINISTRATOR) || Boolean(perms & PERM_KICK_MEMBERS);
+  return Boolean(perms & PERM_ADMINISTRATOR) || Boolean(perms & perm);
 }
+
+/** True if the bot has Kick Members at all (ignores role order). */
+export function botHasKickPermission(meta, botMember) {
+  return botHasPermission(meta, botMember, PERM_KICK_MEMBERS);
+}
+
+/** Discord IDs encode their creation time. */
+export const snowflakeTime = (id) => Number((BigInt(id) >> 22n) + 1420070400000n);

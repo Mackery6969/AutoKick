@@ -1,10 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  actionOf,
   assess,
   DAY_MS,
   formatDuration,
+  formatShortDuration,
   lastActiveAt,
+  quickLeaveBanMs,
   listVerdict,
   channelCounts,
   countsAsVoice,
@@ -185,6 +188,30 @@ test('warnings: members already past the limit are warned before they can be kic
   assert.equal(muted.warnNow, false, 'no warnings while muted');
 });
 
+test('role action: marked members are done until they are active again', () => {
+  const now = 100 * DAY_MS;
+  const roleCfg = (activity) => cfg({ action: { type: 'role', give: ['inactive'] }, activity });
+  const ctx = { now, downtime: [] };
+
+  const marked = assess(plain({ marked: { at: now - DAY_MS } }), roleCfg({ m: now - 40 * DAY_MS }), ctx);
+  assert.equal(marked.action, 'done');
+  assert.equal(marked.markedAt, now - DAY_MS);
+
+  const back = assess(plain({ marked: { at: now - DAY_MS } }), roleCfg({ m: now - 3600_000 }), ctx);
+  assert.equal(back.action, 'keep', 'active since being marked');
+
+  const switched = assess(plain({ marked: { at: now - DAY_MS } }), cfg({ activity: { m: now - 40 * DAY_MS } }), ctx);
+  assert.equal(switched.action, 'kick', 'action changed to kick: marked members are due');
+
+  const whitelisted = cfg({ action: { type: 'role' }, whitelist: { roles: [], users: ['m'] } });
+  assert.equal(assess(plain({ marked: { at: now } }), whitelisted, ctx).action, 'protected');
+});
+
+test('actionOf fills in defaults', () => {
+  assert.deepEqual(actionOf(cfg()), { type: 'kick', banDays: 7, give: [], take: [] });
+  assert.deepEqual(actionOf(cfg({ action: { type: 'tempban', banDays: 3 } })), { type: 'tempban', banDays: 3, give: [], take: [] });
+});
+
 test('warningMs is off at 0 and when it would not fit before the limit', () => {
   assert.equal(warningMs(cfg()), 0);
   assert.equal(warningMs(cfg({ warnDays: 0 })), 0);
@@ -248,6 +275,25 @@ test('countsAsVoice: in a channel, not AFK, not deafened', () => {
   assert.equal(countsAsVoice('afk', false, 'afk'), false, 'AFK channel');
   assert.equal(countsAsVoice(null, false, 'afk'), false, 'not in voice');
   assert.equal(countsAsVoice('vc', false, null), true, 'server has no AFK channel');
+});
+
+test('quickLeaveBanMs: only leaving within the window, never whitelisted members, off at 0', () => {
+  const c = cfg({ quickLeave: { minutes: 10, banDays: 7 }, whitelist: { roles: [], users: ['friend'] } });
+  const left = (ms, userId = 'u') => quickLeaveBanMs(c, { userId, joinedAt: 1000, leftAt: 1000 + ms });
+  assert.equal(left(30_000), 7 * DAY_MS, '30 seconds');
+  assert.equal(left(10 * 60_000), 7 * DAY_MS, 'exactly at the limit');
+  assert.equal(left(10 * 60_000 + 1), 0, 'stayed longer');
+  assert.equal(left(1000, 'friend'), 0, 'whitelisted member');
+  assert.equal(quickLeaveBanMs(c, { userId: 'u', joinedAt: null, leftAt: 5 }), 0, 'join time unknown');
+  assert.equal(quickLeaveBanMs(cfg({ quickLeave: { minutes: 0, banDays: 7 } }), { userId: 'u', joinedAt: 0, leftAt: 1 }), 0, 'off');
+  assert.equal(quickLeaveBanMs(cfg(), { userId: 'u', joinedAt: 0, leftAt: 1 }), 0, 'never configured');
+});
+
+test('formatShortDuration', () => {
+  assert.equal(formatShortDuration(1500), '1 second');
+  assert.equal(formatShortDuration(45_000), '45 seconds');
+  assert.equal(formatShortDuration(2 * 60_000 + 5000), '2 minutes');
+  assert.equal(formatShortDuration(3 * 3600_000), '3 hours');
 });
 
 test('formatDuration', () => {

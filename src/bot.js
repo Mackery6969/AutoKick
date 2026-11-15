@@ -9,20 +9,32 @@
 
 import { DurableObject } from 'cloudflare:workers';
 import {
+  ACTION_DONE,
+  actionOf,
   assess,
   channelCounts,
   countsAsVoice,
   DAY_MS,
   escapeMarkdown,
   formatDuration,
+  formatShortDuration,
   pauseChanges,
+  quickLeaveBanMs,
 } from './policy.js';
 import {
   APP_FLAGS_MEMBERS_INTENT,
-  botHasKickPermission,
+  botHasPermission,
+  PERM_BAN_MEMBERS,
+  PERM_KICK_MEMBERS,
+  PERM_MANAGE_ROLES,
+  PERM_VIEW_AUDIT_LOG,
+  rolesAboveBot,
+  snowflakeTime,
   Budget,
   BudgetExceeded,
+  canBan,
   canKick,
+  canManageRoles,
   canViewChannel,
   detectedPauseRoleIds,
   discordRest,
@@ -51,6 +63,14 @@ const WARN_RETRY_MS = 60 * 60_000;
 // Warning DMs go out at most this many per server per minute, so turning
 // warnings on in a big server spreads the first batch out instead of mass-DMing.
 const MAX_WARNINGS_PER_RUN = 10;
+const JOIN_KEEP_MS = 25 * 60 * 60_000; // quick-leave window is at most 24 hours
+const AUDIT_MEMBER_KICK = 20;
+// Every ban this bot places has a reason starting with this, so it only ever lifts its own bans.
+const BAN_REASON_PREFIX = 'AutoKick:';
+const SOFTBAN_DELETE_SECONDS = 7 * 24 * 60 * 60; // the most Discord allows
+const PERM_FOR_ACTION = { kick: PERM_KICK_MEMBERS, tempban: PERM_BAN_MEMBERS, softban: PERM_BAN_MEMBERS, role: PERM_MANAGE_ROLES };
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const unix = (ms, style = 'R') => `<t:${Math.floor(ms / 1000)}:${style}>`;
 const REQUEST_BUDGET = 44; // leaves headroom under the free plan's 50
 const DEFAULT_GATEWAY = 'wss://gateway.discord.gg';
 const COUNTED_MESSAGE_TYPES = new Set([0, 18, 19]); // normal message, thread created, reply
@@ -95,6 +115,8 @@ function defaultConfig(now) {
     pauseRoles: [], // members with these roles don't lose time (plus auto-detected "Muted" roles)
     channels: { whitelist: [], blacklist: [] }, // where activity counts (channels, categories, threads)
     warnDays: 0, // DM members this many days before a kick (0 = off)
+    quickLeave: { minutes: 0, banDays: 7 }, // ban people who leave within `minutes` of joining (0 = off)
+    action: { type: 'kick', banDays: 7, give: [], take: [] }, // what happens to inactive members (see actionOf)
   };
 }
 
@@ -125,6 +147,29 @@ export class AutoKickBot extends DurableObject {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS warnings (
       guild_id TEXT NOT NULL, user_id TEXT NOT NULL, warned_at INTEGER NOT NULL,
       kick_after INTEGER NOT NULL, delivered INTEGER NOT NULL,
+      PRIMARY KEY (guild_id, user_id))`);
+    // Quick-leave bans: recent join times (kept a day), people who left right after
+    // joining and are waiting for the next alarm to ban them, and the bans to lift later.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS joins (
+      guild_id TEXT NOT NULL, user_id TEXT NOT NULL, joined_at INTEGER NOT NULL,
+      PRIMARY KEY (guild_id, user_id))`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS quick_leaves (
+      guild_id TEXT NOT NULL, user_id TEXT NOT NULL, username TEXT, joined_at INTEGER NOT NULL, left_at INTEGER NOT NULL,
+      PRIMARY KEY (guild_id, user_id))`);
+    // kind: 'quickleave', 'inactive' (temp ban action) or 'softban' (lifted right away).
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS temp_bans (
+      guild_id TEXT NOT NULL, user_id TEXT NOT NULL, username TEXT, banned_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'quickleave', PRIMARY KEY (guild_id, user_id))`);
+    try {
+      this.sql.exec("ALTER TABLE temp_bans ADD COLUMN kind TEXT NOT NULL DEFAULT 'quickleave'");
+    } catch (err) {
+      if (!/duplicate column/i.test(err.message)) throw err;
+    }
+    // Role action: which roles were given/taken per member, undone when they're active again.
+    // complete = 0 while the changes are still being made.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS role_actions (
+      guild_id TEXT NOT NULL, user_id TEXT NOT NULL, applied_at INTEGER NOT NULL,
+      added TEXT NOT NULL, removed TEXT NOT NULL, complete INTEGER NOT NULL,
       PRIMARY KEY (guild_id, user_id))`);
 
     this.ws = null;
@@ -317,6 +362,8 @@ export class AutoKickBot extends DurableObject {
     this.sql.exec('DELETE FROM voice WHERE guild_id = ? AND user_id = ?', guildId, userId);
     this.sql.exec('DELETE FROM pauses WHERE guild_id = ? AND user_id = ?', guildId, userId);
     this.sql.exec('DELETE FROM warnings WHERE guild_id = ? AND user_id = ?', guildId, userId);
+    this.sql.exec('DELETE FROM joins WHERE guild_id = ? AND user_id = ?', guildId, userId);
+    this.sql.exec('DELETE FROM role_actions WHERE guild_id = ? AND user_id = ?', guildId, userId);
     this.lastWrite.delete(`${guildId}:${userId}`);
     this.recent.get(guildId)?.delete(userId);
     this.memberCache.get(guildId)?.members.delete(userId);
@@ -328,6 +375,9 @@ export class AutoKickBot extends DurableObject {
     this.sql.exec('DELETE FROM voice WHERE guild_id = ?', guildId);
     this.sql.exec('DELETE FROM pauses WHERE guild_id = ?', guildId);
     this.sql.exec('DELETE FROM warnings WHERE guild_id = ?', guildId);
+    for (const table of ['joins', 'quick_leaves', 'temp_bans', 'role_actions']) {
+      this.sql.exec(`DELETE FROM ${table} WHERE guild_id = ?`, guildId);
+    }
     this.recent.delete(guildId);
     this.channelParents.delete(guildId);
     this.guildCache.delete(guildId);
@@ -565,9 +615,11 @@ export class AutoKickBot extends DurableObject {
           const rows = this.pauseRows(d.guild_id, record.id).get(record.id) ?? [];
           this.syncPause(d.guild_id, record, rows, meta ? pauseRoleIds(cfg, meta) : null);
         }
+        if (t === 'GUILD_MEMBER_ADD') this.onMemberJoin(d.guild_id, record);
         return;
       }
       case 'GUILD_MEMBER_REMOVE':
+        this.onMemberLeave(d);
         return this.forgetMember(d.guild_id, d.user.id);
       // Keep the channel → category / thread → channel map current (for the channel lists).
       case 'CHANNEL_CREATE':
@@ -650,6 +702,38 @@ export class AutoKickBot extends DurableObject {
     this.touchVoice(d.id);
   }
 
+  /** Remember when someone joined, so leaving right after can be spotted. */
+  onMemberJoin(guildId, record) {
+    // Back before their quick-leave ban went out: they're a member again, so no ban.
+    this.sql.exec('DELETE FROM quick_leaves WHERE guild_id = ? AND user_id = ?', guildId, record.id);
+    if (record.bot) return;
+    this.sql.exec(
+      'INSERT OR REPLACE INTO joins (guild_id, user_id, joined_at) VALUES (?, ?, ?)',
+      guildId,
+      record.id,
+      record.joinedTimestamp ?? Date.now(),
+    );
+  }
+
+  /** Queue a ban if they left too soon after joining. The next alarm places it (no REST calls here). */
+  onMemberLeave(d) {
+    if (d.user?.bot) return;
+    const join = this.sql
+      .exec('SELECT joined_at FROM joins WHERE guild_id = ? AND user_id = ?', d.guild_id, d.user.id)
+      .toArray()[0];
+    if (!join) return;
+    const now = Date.now();
+    if (!quickLeaveBanMs(this.getConfig(d.guild_id), { userId: d.user.id, joinedAt: join.joined_at, leftAt: now })) return;
+    this.sql.exec(
+      'INSERT OR REPLACE INTO quick_leaves (guild_id, user_id, username, joined_at, left_at) VALUES (?, ?, ?, ?, ?)',
+      d.guild_id,
+      d.user.id,
+      d.user.global_name ?? d.user.username ?? null,
+      join.joined_at,
+      now,
+    );
+  }
+
   onMessage(d) {
     if (!d.guild_id || d.author?.bot || d.webhook_id || !COUNTED_MESSAGE_TYPES.has(d.type)) return;
     if (!this.countsInChannel(d.guild_id, d.channel_id)) return; // channel whitelist/blacklist
@@ -703,6 +787,8 @@ export class AutoKickBot extends DurableObject {
         this.touchVoice();
         await this.syncCommands(budget);
         await this.loadMissingGuildMeta(budget);
+        await this.runBans(budget);
+        await this.runRoleReverts(budget);
         await this.runSweeps(budget);
       }
     } catch (err) {
@@ -760,16 +846,34 @@ export class AutoKickBot extends DurableObject {
     return { meta, members: cache.members };
   }
 
-  assessWith(cfg, meta, botMember, member, pauseRows, warning, ctx) {
+  /** Can the bot carry out the configured action on this member? */
+  canAct(cfg, meta, botMember, member) {
+    const action = actionOf(cfg);
+    if (action.type === 'role') return canManageRoles(meta, botMember, [...action.give, ...action.take]);
+    if (action.type === 'tempban' || action.type === 'softban') return canBan(meta, botMember, member);
+    return canKick(meta, botMember, member);
+  }
+
+  /** Members the role action was fully applied to: userId -> { at }. */
+  markedRows(guildId, userId = null) {
+    const query = 'SELECT user_id, applied_at FROM role_actions WHERE guild_id = ? AND complete = 1';
+    const rows = userId
+      ? this.sql.exec(`${query} AND user_id = ?`, guildId, userId).toArray()
+      : this.sql.exec(query, guildId).toArray();
+    return new Map(rows.map((r) => [r.user_id, { at: r.applied_at }]));
+  }
+
+  assessWith(cfg, meta, botMember, member, pauseRows, warning, marked, ctx) {
     const { now } = ctx;
     const current = pauseRows.find((r) => r.started_at <= now && (r.ended_at === null || r.ended_at > now));
     const snapshot = {
       ...member,
       isOwner: member.id === meta.ownerId,
-      kickable: canKick(meta, botMember, member),
+      kickable: this.canAct(cfg, meta, botMember, member),
       pauses: pauseRows.map((r) => [r.started_at, r.ended_at ?? now]),
       pausedBy: current?.kind ?? null,
       warning,
+      marked,
     };
     return assess(snapshot, cfg, ctx);
   }
@@ -795,17 +899,31 @@ export class AutoKickBot extends DurableObject {
     const full = { ...cfg, activity: this.activityMap(guildId) };
     const ctx = { now, downtime: this.getState('downtime', []) };
     const warnings = this.warningRows(guildId);
+    const marked = this.markedRows(guildId);
     const results = [...members.values()].map((member) => ({
       member,
-      result: this.assessWith(full, meta, botMember, member, pauses.get(member.id) ?? [], warnings.get(member.id) ?? null, ctx),
+      result: this.assessWith(
+        full,
+        meta,
+        botMember,
+        member,
+        pauses.get(member.id) ?? [],
+        warnings.get(member.id) ?? null,
+        marked.get(member.id) ?? null,
+        ctx,
+      ),
     }));
+    const action = actionOf(cfg);
     return {
       cfg,
       meta,
       botMember,
       results,
       detectedPauseRoles: detectedPauseRoleIds(meta),
-      botCanKick: botHasKickPermission(meta, botMember),
+      botCanAct: botHasPermission(meta, botMember, PERM_FOR_ACTION[action.type] ?? PERM_KICK_MEMBERS),
+      rolesAboveBot: action.type === 'role' ? rolesAboveBot(meta, botMember, [...action.give, ...action.take]) : [],
+      botCanBan: botHasPermission(meta, botMember, PERM_BAN_MEMBERS),
+      botCanViewAuditLog: botHasPermission(meta, botMember, PERM_VIEW_AUDIT_LOG),
     };
   }
 
@@ -821,7 +939,11 @@ export class AutoKickBot extends DurableObject {
     const ctx = { now, downtime: this.getState('downtime', []) };
     const botMember = members.get(this.getState('botId'));
     const warning = this.warningRows(guildId, userId).get(userId) ?? null;
-    return { member, result: this.assessWith(full, meta, botMember, member, pauses.get(userId) ?? [], warning, ctx) };
+    const marked = this.markedRows(guildId, userId).get(userId) ?? null;
+    return {
+      member,
+      result: this.assessWith(full, meta, botMember, member, pauses.get(userId) ?? [], warning, marked, ctx),
+    };
   }
 
   /**
@@ -912,9 +1034,10 @@ export class AutoKickBot extends DurableObject {
         .sort(byInactivity);
 
       for (const { member, result } of targets) {
-        if (budget.remaining < 4) return false;
-        if (!this.getConfig(guildId)?.enabled) return true; // turned off mid-sweep
-        await this.kickMember(guildId, meta, member, result, budget);
+        const latest = this.getConfig(guildId);
+        if (!latest?.enabled) return true; // turned off mid-sweep
+        if (budget.remaining < this.requestsFor(latest)) return false;
+        await this.actOn(guildId, meta, latest, member, result, budget);
       }
       let warned = 0;
       for (const { member, result } of toWarn) {
@@ -932,44 +1055,230 @@ export class AutoKickBot extends DurableObject {
     }
   }
 
-  async kickMember(guildId, meta, member, result, budget) {
-    const duration = formatDuration(result.inactiveMs);
+  /** Most requests one action can take (DM, the action itself, log), so a run never stops halfway through one. */
+  requestsFor(cfg) {
+    const action = actionOf(cfg);
+    if (action.type === 'role') return 3 + action.give.length + action.take.length;
+    return action.type === 'softban' ? 5 : 4;
+  }
+
+  /** Send a DM. Returns null if it went through, or the error (DMs closed, blocked, Discord trouble). */
+  async sendDm(userId, content, budget) {
     try {
-      const dm = await this.rest('POST', '/users/@me/channels', { body: { recipient_id: member.id }, budget });
-      await this.rest('POST', `/channels/${dm.id}/messages`, {
-        body: {
-          content:
-            `You were removed from **${escapeMarkdown(meta.name)}** because you hadn't sent a message ` +
-            `or joined a voice channel there in ${duration}. You're welcome to rejoin any time.`,
-        },
-        budget,
-      });
+      const dm = await this.rest('POST', '/users/@me/channels', { body: { recipient_id: userId }, budget });
+      await this.rest('POST', `/channels/${dm.id}/messages`, { body: { content, allowed_mentions: { parse: [] } }, budget });
+      return null;
     } catch (err) {
       if (err instanceof BudgetExceeded) throw err;
-      // DMs closed or blocked: kick anyway.
+      return err;
     }
+  }
+
+  async logSafely(guildId, content, budget) {
+    await this.log(guildId, content, budget).catch((err) => {
+      if (err instanceof BudgetExceeded) throw err;
+    });
+  }
+
+  /** Carry out the configured action on a member who is past the limit. */
+  async actOn(guildId, meta, cfg, member, result, budget) {
+    const action = actionOf(cfg);
+    if (action.type === 'role') return this.markInactive(guildId, meta, action, member, result, budget);
+    return this.removeMember(guildId, meta, action, member, result, budget);
+  }
+
+  /** Kick, temp ban or soft ban. */
+  async removeMember(guildId, meta, action, member, result, budget) {
+    const duration = formatDuration(result.inactiveMs);
+    const server = `**${escapeMarkdown(meta.name)}**`;
+    const why = `because you hadn't sent a message or joined a voice channel there in ${duration}`;
+    const now = Date.now();
+    const expiresAt = now + action.banDays * DAY_MS;
+    // Our own removal must never look like a quick leave.
+    this.sql.exec('DELETE FROM joins WHERE guild_id = ? AND user_id = ?', guildId, member.id);
+
+    // DM first: once they're out of the server the bot usually can't message them. DMs closed: carry on.
+    await this.sendDm(
+      member.id,
+      action.type === 'tempban'
+        ? `You were banned from ${server} for ${plural(action.banDays, 'day')} ${why}. ` +
+            `The ban ends ${unix(expiresAt)} (${unix(expiresAt, 'f')}), and you're welcome to rejoin after that.`
+        : `You were removed from ${server} ${why}. You're welcome to rejoin any time.`,
+      budget,
+    );
 
     try {
-      await this.rest('DELETE', `/guilds/${guildId}/members/${member.id}`, {
-        reason: `AutoKick: inactive for ${duration}`,
-        budget,
-      });
+      if (action.type === 'kick') {
+        await this.rest('DELETE', `/guilds/${guildId}/members/${member.id}`, { reason: `AutoKick: inactive for ${duration}`, budget });
+      } else {
+        const soft = action.type === 'softban';
+        // Record the ban before placing it, so it gets lifted even if this run is cut short.
+        this.recordTempBan(guildId, member.id, member.username, soft ? now : expiresAt, soft ? 'softban' : 'inactive');
+        try {
+          await this.rest('PUT', `/guilds/${guildId}/bans/${member.id}`, {
+            body: { delete_message_seconds: soft ? SOFTBAN_DELETE_SECONDS : 0 },
+            reason: soft
+              ? `${BAN_REASON_PREFIX} soft ban (inactive for ${duration}), unbanned right away.`
+              : `${BAN_REASON_PREFIX} inactive for ${duration}. Temporary ban until ` +
+                `${new Date(expiresAt).toISOString().slice(0, 10)} (UTC), lifted automatically.`,
+            budget,
+          });
+        } catch (err) {
+          this.forgetTempBan(guildId, member.id);
+          throw err;
+        }
+        if (soft) {
+          // If this fails, the ban stays recorded as due and the next run lifts it.
+          await this.rest('DELETE', `/guilds/${guildId}/bans/${member.id}`, { reason: 'AutoKick: soft ban', budget })
+            .then(() => this.forgetTempBan(guildId, member.id))
+            .catch((err) => {
+              if (err instanceof BudgetExceeded) throw err;
+              console.warn(`Soft ban: could not unban ${member.id} in ${guildId} yet: ${err.message}`);
+            });
+        }
+      }
     } catch (err) {
       if (err instanceof BudgetExceeded) throw err;
       this.kickFailures.set(`${guildId}:${member.id}`, Date.now());
-      console.warn(`Could not kick ${member.id} from ${guildId}: ${err.message}`);
+      console.warn(`Could not ${action.type} ${member.id} in ${guildId}: ${err.message}`);
       return;
     }
 
     this.forgetMember(guildId, member.id);
-    console.log(`Kicked ${member.id} from ${guildId} (inactive ${duration}).`);
-    await this.log(
+    console.log(`${action.type} ${member.id} in ${guildId} (inactive ${duration}).`);
+    const who = `<@${member.id}> (**${escapeMarkdown(member.username)}**)`;
+    const reason = `no messages or voice activity for ${duration}`;
+    const line = {
+      kick: `👢 Kicked ${who}: ${reason}.`,
+      tempban: `🔨 Banned ${who} for ${plural(action.banDays, 'day')}: ${reason}. Unbanned automatically ${unix(expiresAt)}.`,
+      softban: `🧹 Soft-banned ${who} (removed, and their messages from the last 7 days deleted): ${reason}.`,
+    }[action.type];
+    await this.logSafely(guildId, line, budget);
+  }
+
+  /**
+   * Role action: give and take the configured roles, remembering exactly what
+   * changed so it can be undone once they're active again.
+   */
+  async markInactive(guildId, meta, action, member, result, budget) {
+    const duration = formatDuration(result.inactiveMs);
+    const reason = `AutoKick: inactive for ${duration}`;
+    // Pick up an earlier attempt that was cut short, so its changes still get undone later.
+    const earlier = this.sql
+      .exec('SELECT applied_at, added, removed FROM role_actions WHERE guild_id = ? AND user_id = ? AND complete = 0', guildId, member.id)
+      .toArray()[0];
+    const appliedAt = earlier?.applied_at ?? Date.now();
+    const added = earlier ? JSON.parse(earlier.added) : [];
+    const removed = earlier ? JSON.parse(earlier.removed) : [];
+    const save = (complete) =>
+      this.sql.exec(
+        `INSERT OR REPLACE INTO role_actions (guild_id, user_id, applied_at, added, removed, complete) VALUES (?, ?, ?, ?, ?, ?)`,
+        guildId,
+        member.id,
+        appliedAt,
+        JSON.stringify(added),
+        JSON.stringify(removed),
+        complete ? 1 : 0,
+      );
+
+    let failure = null;
+    try {
+      for (const roleId of action.give.filter((id) => !member.roleIds.includes(id) && !added.includes(id))) {
+        await this.rest('PUT', `/guilds/${guildId}/members/${member.id}/roles/${roleId}`, { reason, budget });
+        added.push(roleId);
+        save(false);
+      }
+      for (const roleId of action.take.filter((id) => member.roleIds.includes(id) && !removed.includes(id))) {
+        await this.rest('DELETE', `/guilds/${guildId}/members/${member.id}/roles/${roleId}`, { reason, budget });
+        removed.push(roleId);
+        save(false);
+      }
+    } catch (err) {
+      if (err instanceof BudgetExceeded) throw err; // saved as incomplete: finished next run
+      failure = err;
+      this.kickFailures.set(`${guildId}:${member.id}`, Date.now());
+      console.warn(`Could not change roles for ${member.id} in ${guildId}: ${err.message}`);
+    }
+    save(true);
+
+    const who = `<@${member.id}> (**${escapeMarkdown(member.username)}**)`;
+    const changes = [
+      added.length ? `gave ${added.map((id) => `<@&${id}>`).join(', ')}` : '',
+      removed.length ? `took ${removed.map((id) => `<@&${id}>`).join(', ')}` : '',
+    ].filter(Boolean);
+    if (changes.length) {
+      await this.sendDm(
+        member.id,
+        `You've been marked as inactive in **${escapeMarkdown(meta.name)}** because you hadn't sent a message ` +
+          `or joined a voice channel there in ${duration}. To undo it, send a message or join a voice channel there.`,
+        budget,
+      );
+    }
+    await this.logSafely(
       guildId,
-      `👢 Kicked <@${member.id}> (**${escapeMarkdown(member.username)}**): no messages or voice activity for ${duration}.`,
+      `🏷️ Marked ${who} inactive (${changes.join('; ') || 'their roles were already set'}): ` +
+        `no messages or voice activity for ${duration}.` +
+        (failure ? ` ⚠️ Some role changes failed: ${failure.message}` : ''),
       budget,
-    ).catch((err) => {
-      if (err instanceof BudgetExceeded) throw err;
-    });
+    );
+  }
+
+  /** Undo the role action for members who have been active since it was applied. Runs every minute. */
+  async runRoleReverts(budget) {
+    const rows = this.sql
+      .exec(
+        `SELECT r.guild_id, r.user_id, r.applied_at, r.added, r.removed, a.last_active
+         FROM role_actions r LEFT JOIN activity a ON a.guild_id = r.guild_id AND a.user_id = r.user_id`,
+      )
+      .toArray();
+    for (const row of rows) {
+      const lastActive = Math.max(row.last_active ?? 0, this.recent.get(row.guild_id)?.get(row.user_id) ?? 0);
+      if (lastActive <= row.applied_at) continue;
+      const added = JSON.parse(row.added);
+      const removed = JSON.parse(row.removed);
+      if (budget.remaining < added.length + removed.length + 1) return;
+      const forget = () =>
+        this.sql.exec('DELETE FROM role_actions WHERE guild_id = ? AND user_id = ?', row.guild_id, row.user_id);
+      const path = (roleId) => `/guilds/${row.guild_id}/members/${row.user_id}/roles/${roleId}`;
+      const reason = 'AutoKick: active again';
+      let failure = null;
+      try {
+        // Both calls do nothing if the role is already there / already gone, so a retry is harmless.
+        for (const roleId of removed) await this.rest('PUT', path(roleId), { reason, budget });
+        for (const roleId of added) await this.rest('DELETE', path(roleId), { reason, budget });
+      } catch (err) {
+        if (err instanceof BudgetExceeded) throw err;
+        if (err.code !== 10007) failure = err; // 10007 = they've left the server: nothing to undo
+      }
+      forget();
+      const changes = [
+        removed.length ? `gave back ${removed.map((id) => `<@&${id}>`).join(', ')}` : '',
+        added.length ? `removed ${added.map((id) => `<@&${id}>`).join(', ')}` : '',
+      ].filter(Boolean);
+      if (!changes.length && !failure) continue;
+      await this.logSafely(
+        row.guild_id,
+        `🔄 <@${row.user_id}> is active again: ${changes.join('; ') || 'nothing to undo'}.` +
+          (failure ? ` ⚠️ Couldn't undo everything: ${failure.message}` : ''),
+        budget,
+      );
+    }
+  }
+
+  recordTempBan(guildId, userId, username, expiresAt, kind) {
+    this.sql.exec(
+      `INSERT OR REPLACE INTO temp_bans (guild_id, user_id, username, banned_at, expires_at, kind) VALUES (?, ?, ?, ?, ?, ?)`,
+      guildId,
+      userId,
+      username ?? null,
+      Date.now(),
+      expiresAt,
+      kind,
+    );
+  }
+
+  forgetTempBan(guildId, userId) {
+    this.sql.exec('DELETE FROM temp_bans WHERE guild_id = ? AND user_id = ?', guildId, userId);
   }
 
   /**
@@ -985,29 +1294,27 @@ export class AutoKickBot extends DurableObject {
     const only = cfg.channels.whitelist.length
       ? `\nOnly activity in these channels counts: ${cfg.channels.whitelist.slice(0, 20).map((id) => `<#${id}>`).join(', ')}`
       : '';
-    let delivered = true;
-    try {
-      const dm = await this.rest('POST', '/users/@me/channels', { body: { recipient_id: member.id }, budget });
-      await this.rest('POST', `/channels/${dm.id}/messages`, {
-        body: {
-          content:
-            `⚠️ You haven't sent a message or joined a voice channel in **${escapeMarkdown(meta.name)}** for ${inactive}. ` +
-            `If that doesn't change, you'll be removed from the server ${when} ` +
-            `(<t:${Math.floor(kickAfter / 1000)}:f>).\n` +
-            `To stay, send a message or join a voice channel there (not deafened) before then.${only}`,
-          allowed_mentions: { parse: [] },
-        },
-        budget,
-      });
-    } catch (err) {
-      if (err instanceof BudgetExceeded) throw err;
-      if (!(err.status >= 400 && err.status < 500 && err.status !== 429)) {
-        this.warnFailures.set(`${guildId}:${member.id}`, now);
-        console.warn(`Could not warn ${member.id} in ${guildId}: ${err.message}`);
-        return;
-      }
-      delivered = false; // DMs closed or the bot is blocked
+    const action = actionOf(cfg);
+    const consequence = {
+      kick: "you'll be removed from the server",
+      softban: "you'll be removed from the server",
+      tempban: `you'll be banned from the server for ${plural(action.banDays, 'day')}`,
+      role: "you'll be marked as inactive there",
+    }[action.type];
+    const stay = action.type === 'role' ? 'To avoid it' : 'To stay';
+    const err = await this.sendDm(
+      member.id,
+      `⚠️ You haven't sent a message or joined a voice channel in **${escapeMarkdown(meta.name)}** for ${inactive}. ` +
+        `If that doesn't change, ${consequence} ${when} (${unix(kickAfter, 'f')}).\n` +
+        `${stay}, send a message or join a voice channel there (not deafened) before then.${only}`,
+      budget,
+    );
+    if (err && !(err.status >= 400 && err.status < 500 && err.status !== 429)) {
+      this.warnFailures.set(`${guildId}:${member.id}`, now);
+      console.warn(`Could not warn ${member.id} in ${guildId}: ${err.message}`);
+      return;
     }
+    const delivered = !err; // a 4xx means DMs closed or the bot is blocked
 
     this.sql.exec(
       `INSERT INTO warnings (guild_id, user_id, warned_at, kick_after, delivered) VALUES (?, ?, ?, ?, ?)
@@ -1019,15 +1326,159 @@ export class AutoKickBot extends DurableObject {
       kickAfter,
       delivered ? 1 : 0,
     );
-    await this.log(
+    await this.logSafely(
       guildId,
       `⚠️ Warned <@${member.id}> (**${escapeMarkdown(member.username)}**): inactive ${inactive}, ` +
-        `will be kicked ${when} if they stay inactive.` +
+        `will be ${ACTION_DONE[action.type]} ${when} if they stay inactive.` +
         (delivered ? '' : " Their DMs are closed, so the warning didn't reach them."),
       budget,
-    ).catch((err) => {
+    );
+  }
+
+  // ---------------------------------------------------------------- bans (quick-leave, temp ban, soft ban)
+
+  /** Place queued quick-leave bans, and lift temporary bans that have run out. Runs every minute. */
+  async runBans(budget) {
+    const now = Date.now();
+    this.sql.exec('DELETE FROM joins WHERE joined_at < ?', now - JOIN_KEEP_MS);
+
+    const pending = this.sql
+      .exec('SELECT guild_id, user_id, username, joined_at, left_at FROM quick_leaves ORDER BY left_at')
+      .toArray();
+    const kicks = new Map(); // guildId -> Map<userId, time of their latest kick>, or null if unreadable
+    for (const row of pending) {
+      if (budget.remaining < 6) return;
+      await this.banQuickLeaver(row, kicks, budget);
+    }
+
+    const expired = this.sql
+      .exec('SELECT guild_id, user_id, username, kind FROM temp_bans WHERE expires_at <= ? ORDER BY expires_at', now)
+      .toArray();
+    for (const row of expired) {
+      if (budget.remaining < 4) return;
+      await this.liftTempBan(row, budget);
+    }
+  }
+
+  async banQuickLeaver(row, kicks, budget) {
+    const { guild_id: guildId, user_id: userId } = row;
+    const done = () => this.sql.exec('DELETE FROM quick_leaves WHERE guild_id = ? AND user_id = ?', guildId, userId);
+    const cfg = this.getConfig(guildId);
+    const banMs = quickLeaveBanMs(cfg, { userId, joinedAt: row.joined_at, leftAt: row.left_at });
+    if (!banMs) return done(); // turned off, or whitelisted, since they left
+
+    const stayed = formatShortDuration(row.left_at - row.joined_at);
+    const who = `<@${userId}> (**${escapeMarkdown(row.username ?? userId)}**)`;
+    try {
+      // Kicked by a moderator or another bot (a verification bot, say)? Then they didn't leave on their own.
+      if (!kicks.has(guildId)) kicks.set(guildId, await this.recentKicks(guildId, budget));
+      if ((kicks.get(guildId)?.get(userId) ?? 0) >= row.joined_at) return done();
+      // Already banned by someone else: leave that ban alone, or we'd lift it later.
+      if (await this.findBan(guildId, userId, budget)) return done();
+
+      const expiresAt = Date.now() + banMs;
+      await this.rest('PUT', `/guilds/${guildId}/bans/${userId}`, {
+        body: { delete_message_seconds: 0 },
+        reason:
+          `${BAN_REASON_PREFIX} left ${stayed} after joining. ` +
+          `Temporary ban until ${new Date(expiresAt).toISOString().slice(0, 10)} (UTC), lifted automatically.`,
+        budget,
+      });
+      this.recordTempBan(guildId, userId, row.username, expiresAt, 'quickleave');
+      done();
+      console.log(`Quick-leave ban: ${userId} in ${guildId} (stayed ${stayed}).`);
+      await this.log(
+        guildId,
+        `🚪 Banned ${who} for ${formatDuration(banMs)}: they left ${stayed} after joining. ` +
+          `Unbanned automatically <t:${Math.floor(expiresAt / 1000)}:R>.`,
+        budget,
+      ).catch((err) => {
+        if (err instanceof BudgetExceeded) throw err;
+      });
+    } catch (err) {
       if (err instanceof BudgetExceeded) throw err;
-    });
+      // Discord trouble: try again next minute (for up to an hour). Anything else: give up and say why.
+      if ((err.status >= 500 || err.status === 429 || !err.status) && Date.now() - row.left_at < 60 * 60_000) return;
+      done();
+      console.warn(`Could not ban quick leaver ${userId} in ${guildId}: ${err.message}`);
+      const why = err.status === 403 ? 'I need the **Ban Members** permission.' : err.message;
+      await this.log(guildId, `⚠️ Couldn't ban ${who} (left ${stayed} after joining): ${why}`, budget).catch(() => {});
+    }
+  }
+
+  /** userId -> time of their latest kick, from the audit log. null if the bot can't read it (no View Audit Log). */
+  async recentKicks(guildId, budget) {
+    try {
+      const log = await this.rest('GET', `/guilds/${guildId}/audit-logs?action_type=${AUDIT_MEMBER_KICK}&limit=50`, {
+        budget,
+      });
+      const kicks = new Map();
+      for (const entry of log.audit_log_entries ?? []) {
+        const at = snowflakeTime(entry.id);
+        if (entry.target_id && at > (kicks.get(entry.target_id) ?? 0)) kicks.set(entry.target_id, at);
+      }
+      return kicks;
+    } catch (err) {
+      if (err instanceof BudgetExceeded) throw err;
+      return null;
+    }
+  }
+
+  /** The ban on this user, or null if they aren't banned. */
+  async findBan(guildId, userId, budget) {
+    try {
+      return await this.rest('GET', `/guilds/${guildId}/bans/${userId}`, { budget });
+    } catch (err) {
+      if (err.status === 404) return null;
+      throw err;
+    }
+  }
+
+  async liftTempBan(row, budget) {
+    const { guild_id: guildId, user_id: userId } = row;
+    const forget = () => this.forgetTempBan(guildId, userId);
+    const who = `<@${userId}> (**${escapeMarkdown(row.username ?? userId)}**)`;
+    const what = { quickleave: 'quick-leave ban', inactive: 'temporary ban for inactivity', softban: 'soft ban' }[row.kind] ?? 'ban';
+    try {
+      const ban = await this.findBan(guildId, userId, budget);
+      if (!ban) return forget(); // someone already unbanned them
+      if (!ban.reason?.startsWith(BAN_REASON_PREFIX)) {
+        // A moderator replaced it with their own ban: that one stays.
+        forget();
+        await this.logSafely(guildId, `🔒 Left ${who} banned: their ${what} was replaced by another ban.`, budget);
+        return;
+      }
+      await this.rest('DELETE', `/guilds/${guildId}/bans/${userId}`, { reason: `AutoKick: ${what} ended`, budget });
+      forget();
+      // A soft ban was already logged when it happened; this only finished it.
+      if (row.kind !== 'softban') await this.logSafely(guildId, `🔓 Unbanned ${who}: their ${what} ended.`, budget);
+    } catch (err) {
+      if (err instanceof BudgetExceeded) throw err;
+      // Lost Ban Members, or Discord trouble: try again in an hour.
+      this.sql.exec(
+        'UPDATE temp_bans SET expires_at = ? WHERE guild_id = ? AND user_id = ?',
+        Date.now() + 60 * 60_000,
+        guildId,
+        userId,
+      );
+      console.warn(`Could not lift the ban on ${userId} in ${guildId}: ${err.message}`);
+    }
+  }
+
+  /** What the bot is allowed to do in this server (for command replies). */
+  async botPermissions(guildId, budget) {
+    const meta = await this.getMeta(guildId, budget);
+    const botId = this.getState('botId');
+    let botMember = this.memberCache.get(guildId)?.members.get(botId);
+    if (!botMember) botMember = memberRecord(await this.rest('GET', `/guilds/${guildId}/members/${botId}`, { budget }));
+    const action = actionOf(this.getConfig(guildId));
+    return {
+      kick: botHasPermission(meta, botMember, PERM_KICK_MEMBERS),
+      ban: botHasPermission(meta, botMember, PERM_BAN_MEMBERS),
+      manageRoles: botHasPermission(meta, botMember, PERM_MANAGE_ROLES),
+      auditLog: botHasPermission(meta, botMember, PERM_VIEW_AUDIT_LOG),
+      rolesAboveBot: rolesAboveBot(meta, botMember, [...action.give, ...action.take]),
+    };
   }
 
   async log(guildId, content, budget) {
@@ -1091,6 +1542,8 @@ export class AutoKickBot extends DurableObject {
       assessMember: (userId) => this.assessMember(guildId, userId, budget),
       detectedPauseRoles: async () => detectedPauseRoleIds(await this.getMeta(guildId, budget)),
       hiddenChannels: () => this.hiddenChannels(guildId, budget),
+      botPermissions: () => this.botPermissions(guildId, budget),
+      tempBanCount: () => this.sql.exec('SELECT COUNT(*) AS n FROM temp_bans WHERE guild_id = ?', guildId).toArray()[0].n,
       log: (content) => this.log(guildId, content, budget),
       nextSweepAt: () => (this.getState('sweepQueue') ? Date.now() : this.getState('nextSweepAt', Date.now())),
       connected: () => this.ready,
