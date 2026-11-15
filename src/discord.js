@@ -2,10 +2,11 @@
 
 export const API = 'https://discord.com/api/v10';
 
-// Gateway intents: GUILDS | GUILD_MEMBERS | GUILD_VOICE_STATES | GUILD_MESSAGES.
+// Gateway intents: GUILDS | GUILD_MEMBERS | GUILD_MODERATION | GUILD_VOICE_STATES | GUILD_MESSAGES.
 // GUILD_MEMBERS is privileged: turn on "Server Members Intent" in the Developer Portal.
+// GUILD_MODERATION (ban events, for linked servers) is not privileged.
 // Message *content* is not needed; MESSAGE_CREATE still says who sent the message.
-export const INTENTS = (1 << 0) | (1 << 1) | (1 << 7) | (1 << 9);
+export const INTENTS = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 7) | (1 << 9);
 
 // Application flags that mean the Server Members Intent toggle is on
 // (GATEWAY_GUILD_MEMBERS for verified bots, _LIMITED for bots in under 100 servers).
@@ -147,6 +148,8 @@ function highestPosition(meta, roleIds) {
 export const PERM_BAN_MEMBERS = 1n << 2n;
 export const PERM_VIEW_AUDIT_LOG = 1n << 7n;
 export const PERM_MANAGE_ROLES = 1n << 28n;
+export const PERM_MANAGE_CHANNELS = 1n << 4n;
+export const PERM_MODERATE_MEMBERS = 1n << 40n;
 
 /**
  * Can the bot kick (or ban) `target`? Same rules Discord enforces: the bot needs

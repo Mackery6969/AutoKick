@@ -225,6 +225,148 @@ export function quickLeaveBanMs(cfg, { userId, joinedAt, leftAt }) {
   return banDays * DAY_MS;
 }
 
+// ---------------------------------------------------------------- auto slow mode
+
+/** Messages in the last minute -> slow mode seconds. The busier the chat, the longer the wait. */
+export const SLOWMODE_TIERS = [
+  [0, 0],
+  [12, 2],
+  [20, 5],
+  [30, 10],
+  [45, 15],
+  [60, 30],
+  [90, 60],
+  [150, 120],
+];
+const SLOWMODE_RAISE_GAP_MS = 60_000; // raise at most once a minute
+
+/**
+ * Sensitivity scales how busy chat has to be: 'high' kicks in at half the
+ * messages, 'low' needs twice as many.
+ */
+export const SLOWMODE_SENSITIVITY = { low: 0.5, normal: 1, high: 2 };
+
+export function slowmodeForRate(rate, sensitivity = 'normal') {
+  const scaled = rate * (SLOWMODE_SENSITIVITY[sensitivity] ?? 1);
+  let seconds = 0;
+  for (const [minRate, s] of SLOWMODE_TIERS) if (scaled >= minRate) seconds = s;
+  return seconds;
+}
+
+/** Messages a minute needed for each step at this sensitivity: [[messages, seconds], ...] (the off step left out). */
+export function slowmodeScale(sensitivity = 'normal') {
+  const factor = SLOWMODE_SENSITIVITY[sensitivity] ?? 1;
+  return SLOWMODE_TIERS.slice(1).map(([minRate, s]) => [Math.ceil(minRate / factor), s]);
+}
+
+/**
+ * Next slow mode for a channel. Raises quickly when chat speeds up; lowers
+ * only after it has been calm for `calmMinutes` checks in a row, so it doesn't flap.
+ *   rate          messages in the last minute (whitelisted roles/users not counted)
+ *   current       the channel's slow mode now (null if unknown)
+ *   min, max      limits set for this channel
+ *   sensitivity   'low', 'normal' or 'high'
+ *   calmMinutes   calm minutes in a row before it eases off (one check a minute)
+ *   lowStreak     how many checks in a row the target has been below `current`
+ *   sinceChangeMs time since the bot last changed it
+ * Returns { seconds, lowStreak }; change the channel when seconds !== current.
+ */
+export function nextSlowmode({
+  rate,
+  current,
+  min = 0,
+  max = 30,
+  sensitivity = 'normal',
+  calmMinutes = 3,
+  lowStreak = 0,
+  sinceChangeMs = Infinity,
+}) {
+  const target = Math.min(max, Math.max(min, slowmodeForRate(rate, sensitivity)));
+  if (current === null || current === undefined) return { seconds: target, lowStreak: 0 };
+  if (target > current) {
+    return { seconds: sinceChangeMs >= SLOWMODE_RAISE_GAP_MS ? target : current, lowStreak: 0 };
+  }
+  if (target < current) {
+    // Outside the configured limits (just changed): fix right away.
+    if (current > max) return { seconds: target, lowStreak: 0 };
+    const streak = lowStreak + 1;
+    if (streak >= calmMinutes && sinceChangeMs >= calmMinutes * 60_000) return { seconds: target, lowStreak: 0 };
+    return { seconds: current, lowStreak: streak };
+  }
+  return { seconds: current, lowStreak: 0 };
+}
+
+/** Slow mode whitelist: { channels: { id: settings }, roles: [], users: [] }. */
+export function slowmodeSettings(cfg) {
+  const s = cfg?.slowmode ?? {};
+  return { channels: s.channels ?? {}, roles: s.roles ?? [], users: s.users ?? [] };
+}
+
+/** Whitelisted roles and users don't count toward how busy a channel is. */
+export function countsForSlowmode(cfg, userId, roleIds = []) {
+  const { roles, users } = slowmodeSettings(cfg);
+  return !users.includes(userId) && !roleIds.some((id) => roles.includes(id));
+}
+
+// ---------------------------------------------------------------- server linking
+
+export const LINK_KINDS = ['bans', 'timeouts', 'roles'];
+
+/**
+ * This server's link settings, with defaults: nothing is shared until turned on.
+ * bans/timeouts/roles are the defaults for every linked server; `servers` holds
+ * per-server overrides: { serverId: { bans?, timeouts?, roles? } }.
+ */
+export function linkSettings(cfg) {
+  const link = cfg?.link ?? {};
+  return {
+    bans: link.bans ?? 'off',
+    timeouts: link.timeouts ?? 'off',
+    roles: link.roles ?? 'off',
+    servers: link.servers ?? {},
+    sharedRoles: link.sharedRoles ?? [],
+    exempt: { roles: link.exempt?.roles ?? [], users: link.exempt?.users ?? [] },
+  };
+}
+
+/** Mode ('off', 'send', 'receive' or 'both') for one kind, toward one linked server (or the default). */
+export function linkMode(cfg, kind, otherId = null) {
+  const settings = linkSettings(cfg);
+  return (otherId && settings.servers[otherId]?.[kind]) || settings[kind];
+}
+
+export const linkSends = (cfg, kind, otherId = null) => ['send', 'both'].includes(linkMode(cfg, kind, otherId));
+export const linkReceives = (cfg, kind, otherId = null) => ['receive', 'both'].includes(linkMode(cfg, kind, otherId));
+
+/** Exempt members are never touched by linked servers, and what happens to them here isn't shared. */
+export function linkExempt(cfg, userId, roleIds = []) {
+  const { exempt } = linkSettings(cfg);
+  return exempt.users.includes(userId) || roleIds.some((id) => exempt.roles.includes(id));
+}
+
+/** Shared roles a member gained and lost. Only roles still on the shared list count. */
+export function sharedRoleChanges(before, after, shared) {
+  const had = new Set(before.filter((id) => shared.includes(id)));
+  const has = new Set(after.filter((id) => shared.includes(id)));
+  return { added: [...has].filter((id) => !had.has(id)), removed: [...had].filter((id) => !has.has(id)) };
+}
+
+/** Shared roles are matched across servers by name (ignoring case and spaces at the ends). */
+export const roleKey = (name) => String(name ?? '').trim().toLowerCase();
+
+const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O or 1/I/L to mix up
+
+/** One-time link code like "K7QX-M2PA". */
+export function makeLinkCode(random = (n) => crypto.getRandomValues(new Uint8Array(n))) {
+  const chars = [...random(8)].map((b) => CODE_ALPHABET[b % CODE_ALPHABET.length]);
+  return `${chars.slice(0, 4).join('')}-${chars.slice(4).join('')}`;
+}
+
+export const normalizeLinkCode = (input) => {
+  const raw = String(input ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  return raw.length === 8 ? `${raw.slice(0, 4)}-${raw.slice(4)}` : raw;
+};
+
 export const escapeMarkdown = (text) => String(text).replace(/[\\*_`~|>]/g, '\\$&');
 
 export function formatDuration(ms) {

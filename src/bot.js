@@ -14,6 +14,8 @@ import {
   assess,
   channelCounts,
   countsAsVoice,
+  countsForSlowmode,
+  slowmodeSettings,
   DAY_MS,
   escapeMarkdown,
   formatDuration,
@@ -26,7 +28,9 @@ import {
   botHasPermission,
   PERM_BAN_MEMBERS,
   PERM_KICK_MEMBERS,
+  PERM_MANAGE_CHANNELS,
   PERM_MANAGE_ROLES,
+  PERM_MODERATE_MEMBERS,
   PERM_VIEW_AUDIT_LOG,
   rolesAboveBot,
   snowflakeTime,
@@ -45,6 +49,8 @@ import {
   pauseRoleIds,
 } from './discord.js';
 import { COMMANDS, runCommand } from './commands.js';
+import { linkMethods } from './linking.js';
+import { slowmodeMethods } from './slowmode.js';
 
 const ALARM_MS = 60_000; // check in once a minute (also keeps the object in memory)
 const SWEEP_INTERVAL_MS = 60 * 60_000; // look for inactive members hourly
@@ -171,6 +177,8 @@ export class AutoKickBot extends DurableObject {
       guild_id TEXT NOT NULL, user_id TEXT NOT NULL, applied_at INTEGER NOT NULL,
       added TEXT NOT NULL, removed TEXT NOT NULL, complete INTEGER NOT NULL,
       PRIMARY KEY (guild_id, user_id))`);
+    this.initLinks();
+    this.initSlowmode();
 
     this.ws = null;
     this.ready = false;
@@ -244,6 +252,7 @@ export class AutoKickBot extends DurableObject {
 
   setChannelParents(guildId, channels) {
     this.channelParents.set(guildId, new Map(channels.map((c) => [c.id, c.parent_id ?? null])));
+    for (const channel of channels) this.noteChannelSlowmode(channel);
   }
 
   /** The channel followed by its parents, most specific first: thread → channel → category. */
@@ -364,6 +373,7 @@ export class AutoKickBot extends DurableObject {
     this.sql.exec('DELETE FROM warnings WHERE guild_id = ? AND user_id = ?', guildId, userId);
     this.sql.exec('DELETE FROM joins WHERE guild_id = ? AND user_id = ?', guildId, userId);
     this.sql.exec('DELETE FROM role_actions WHERE guild_id = ? AND user_id = ?', guildId, userId);
+    this.forgetMemberLinks(guildId, userId);
     this.lastWrite.delete(`${guildId}:${userId}`);
     this.recent.get(guildId)?.delete(userId);
     this.memberCache.get(guildId)?.members.delete(userId);
@@ -378,6 +388,7 @@ export class AutoKickBot extends DurableObject {
     for (const table of ['joins', 'quick_leaves', 'temp_bans', 'role_actions']) {
       this.sql.exec(`DELETE FROM ${table} WHERE guild_id = ?`, guildId);
     }
+    this.forgetGuildLinks(guildId);
     this.recent.delete(guildId);
     this.channelParents.delete(guildId);
     this.guildCache.delete(guildId);
@@ -418,7 +429,12 @@ export class AutoKickBot extends DurableObject {
       if (!fixable && Date.now() - fatal.at < FATAL_RETRY_MS) return;
     }
 
-    const session = this.getState('session');
+    let session = this.getState('session');
+    if (session && session.intents !== INTENTS) {
+      // A resumed session keeps the intents it logged in with; new ones need a fresh login.
+      this.setState('session', null);
+      session = null;
+    }
     if (!session && !this.identifyAllowed()) return;
     const base = (session?.resumeUrl ?? DEFAULT_GATEWAY).replace(/^wss:\/\//, 'https://').replace(/\/+$/, '');
     budget.use();
@@ -610,27 +626,43 @@ export class AutoKickBot extends DurableObject {
         const record = memberRecord(d);
         this.memberCache.get(d.guild_id)?.members.set(record.id, record);
         const cfg = this.getConfig(d.guild_id);
+        let prevTimeout = null;
         if (cfg) {
           const meta = this.guildCache.get(d.guild_id);
           const rows = this.pauseRows(d.guild_id, record.id).get(record.id) ?? [];
+          const now = Date.now();
+          prevTimeout = rows.find((r) => r.kind === 'timeout' && r.ended_at > now)?.ended_at ?? null;
           this.syncPause(d.guild_id, record, rows, meta ? pauseRoleIds(cfg, meta) : null);
         }
-        if (t === 'GUILD_MEMBER_ADD') this.onMemberJoin(d.guild_id, record);
+        if (t === 'GUILD_MEMBER_ADD') {
+          this.onMemberJoin(d.guild_id, record);
+          this.onLinkJoin(d.guild_id, record);
+        } else {
+          this.onLinkMemberUpdate(d.guild_id, record, prevTimeout);
+        }
         return;
       }
       case 'GUILD_MEMBER_REMOVE':
         this.onMemberLeave(d);
         return this.forgetMember(d.guild_id, d.user.id);
+      case 'GUILD_BAN_ADD':
+        return this.onLinkBan(d, true);
+      case 'GUILD_BAN_REMOVE':
+        return this.onLinkBan(d, false);
       // Keep the channel → category / thread → channel map current (for the channel lists).
       case 'CHANNEL_CREATE':
       case 'CHANNEL_UPDATE':
       case 'THREAD_CREATE':
       case 'THREAD_UPDATE':
         if (d.guild_id) this.channelParents.get(d.guild_id)?.set(d.id, d.parent_id ?? null);
+        this.noteChannelSlowmode(d);
         return;
       case 'CHANNEL_DELETE':
       case 'THREAD_DELETE':
-        if (d.guild_id) this.channelParents.get(d.guild_id)?.delete(d.id);
+        if (d.guild_id) {
+          this.channelParents.get(d.guild_id)?.delete(d.id);
+          this.forgetSlowmodeChannel(d.guild_id, d.id);
+        }
         return;
       case 'THREAD_LIST_SYNC':
         for (const thread of d.threads ?? []) this.channelParents.get(d.guild_id)?.set(thread.id, thread.parent_id ?? null);
@@ -643,7 +675,7 @@ export class AutoKickBot extends DurableObject {
   }
 
   onReady(d) {
-    this.setState('session', { id: d.session_id, resumeUrl: d.resume_gateway_url, seq: this.seq });
+    this.setState('session', { id: d.session_id, resumeUrl: d.resume_gateway_url, seq: this.seq, intents: INTENTS });
     this.setState('appId', d.application.id);
     this.setState('botId', d.user.id);
     this.setState('fatal', null);
@@ -736,7 +768,12 @@ export class AutoKickBot extends DurableObject {
 
   onMessage(d) {
     if (!d.guild_id || d.author?.bot || d.webhook_id || !COUNTED_MESSAGE_TYPES.has(d.type)) return;
-    if (!this.countsInChannel(d.guild_id, d.channel_id)) return; // channel whitelist/blacklist
+    const cfg = this.getConfig(d.guild_id);
+    // Automatic slow mode: count messages in whitelisted channels, except from whitelisted roles/users.
+    if (slowmodeSettings(cfg).channels[d.channel_id] && countsForSlowmode(cfg, d.author.id, d.member?.roles ?? [])) {
+      this.countMessage(d.channel_id);
+    }
+    if (!this.countsInChannel(d.guild_id, d.channel_id, cfg)) return; // channel whitelist/blacklist
     this.touch(d.guild_id, d.author.id);
   }
 
@@ -787,6 +824,8 @@ export class AutoKickBot extends DurableObject {
         this.touchVoice();
         await this.syncCommands(budget);
         await this.loadMissingGuildMeta(budget);
+        await this.runSlowmode(budget);
+        await this.runLinkJobs(budget);
         await this.runBans(budget);
         await this.runRoleReverts(budget);
         await this.runSweeps(budget);
@@ -1114,6 +1153,7 @@ export class AutoKickBot extends DurableObject {
         const soft = action.type === 'softban';
         // Record the ban before placing it, so it gets lifted even if this run is cut short.
         this.recordTempBan(guildId, member.id, member.username, soft ? now : expiresAt, soft ? 'softban' : 'inactive');
+        this.markOwnBan(guildId, member.id); // inactivity bans aren't shared with linked servers
         try {
           await this.rest('PUT', `/guilds/${guildId}/bans/${member.id}`, {
             body: { delete_message_seconds: soft ? SOFTBAN_DELETE_SECONDS : 0 },
@@ -1129,6 +1169,7 @@ export class AutoKickBot extends DurableObject {
         }
         if (soft) {
           // If this fails, the ban stays recorded as due and the next run lifts it.
+          this.markOwnBan(guildId, member.id);
           await this.rest('DELETE', `/guilds/${guildId}/bans/${member.id}`, { reason: 'AutoKick: soft ban', budget })
             .then(() => this.forgetTempBan(guildId, member.id))
             .catch((err) => {
@@ -1377,6 +1418,7 @@ export class AutoKickBot extends DurableObject {
       if (await this.findBan(guildId, userId, budget)) return done();
 
       const expiresAt = Date.now() + banMs;
+      this.markOwnBan(guildId, userId); // not shared with linked servers
       await this.rest('PUT', `/guilds/${guildId}/bans/${userId}`, {
         body: { delete_message_seconds: 0 },
         reason:
@@ -1448,6 +1490,7 @@ export class AutoKickBot extends DurableObject {
         await this.logSafely(guildId, `🔒 Left ${who} banned: their ${what} was replaced by another ban.`, budget);
         return;
       }
+      this.markOwnBan(guildId, userId);
       await this.rest('DELETE', `/guilds/${guildId}/bans/${userId}`, { reason: `AutoKick: ${what} ended`, budget });
       forget();
       // A soft ban was already logged when it happened; this only finished it.
@@ -1476,6 +1519,8 @@ export class AutoKickBot extends DurableObject {
       kick: botHasPermission(meta, botMember, PERM_KICK_MEMBERS),
       ban: botHasPermission(meta, botMember, PERM_BAN_MEMBERS),
       manageRoles: botHasPermission(meta, botMember, PERM_MANAGE_ROLES),
+      manageChannels: botHasPermission(meta, botMember, PERM_MANAGE_CHANNELS),
+      moderateMembers: botHasPermission(meta, botMember, PERM_MODERATE_MEMBERS),
       auditLog: botHasPermission(meta, botMember, PERM_VIEW_AUDIT_LOG),
       rolesAboveBot: rolesAboveBot(meta, botMember, [...action.give, ...action.take]),
     };
@@ -1543,6 +1588,17 @@ export class AutoKickBot extends DurableObject {
       detectedPauseRoles: async () => detectedPauseRoleIds(await this.getMeta(guildId, budget)),
       hiddenChannels: () => this.hiddenChannels(guildId, budget),
       botPermissions: () => this.botPermissions(guildId, budget),
+      // Automatic slow mode
+      channelSlowmode: (channelId) => this.channelSlowmode(channelId, budget),
+      setSlowmode: (channelId, seconds, reason) => this.setSlowmode(guildId, channelId, seconds, reason, budget),
+      messageRate: (channelId) => this.messageRate(channelId),
+      // Linked servers
+      linkCreate: () => this.createLinkCode(guildId),
+      linkJoin: (code, userId) => this.joinLink(guildId, code, userId, budget),
+      linkList: () => this.linkList(guildId),
+      linkRemove: (query, userId) => this.unlink(guildId, query, userId, budget),
+      linkRoleMatches: () => this.linkRoleMatches(guildId, budget),
+      linkSeedRole: (roleId) => this.seedSharedRole(guildId, roleId, budget),
       tempBanCount: () => this.sql.exec('SELECT COUNT(*) AS n FROM temp_bans WHERE guild_id = ?', guildId).toArray()[0].n,
       log: (content) => this.log(guildId, content, budget),
       nextSweepAt: () => (this.getState('sweepQueue') ? Date.now() : this.getState('nextSweepAt', Date.now())),
@@ -1552,3 +1608,6 @@ export class AutoKickBot extends DurableObject {
     };
   }
 }
+
+// Linked servers (linking.js) and automatic slow mode (slowmode.js) live in their own files.
+Object.assign(AutoKickBot.prototype, linkMethods, slowmodeMethods);

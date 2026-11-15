@@ -6,8 +6,22 @@ import {
   DAY_MS,
   formatDuration,
   formatShortDuration,
+  countsForSlowmode,
   lastActiveAt,
+  linkExempt,
+  linkMode,
+  linkReceives,
+  linkSends,
+  linkSettings,
+  makeLinkCode,
+  nextSlowmode,
+  normalizeLinkCode,
   quickLeaveBanMs,
+  roleKey,
+  sharedRoleChanges,
+  slowmodeForRate,
+  slowmodeScale,
+  slowmodeSettings,
   listVerdict,
   channelCounts,
   countsAsVoice,
@@ -287,6 +301,100 @@ test('quickLeaveBanMs: only leaving within the window, never whitelisted members
   assert.equal(quickLeaveBanMs(c, { userId: 'u', joinedAt: null, leftAt: 5 }), 0, 'join time unknown');
   assert.equal(quickLeaveBanMs(cfg({ quickLeave: { minutes: 0, banDays: 7 } }), { userId: 'u', joinedAt: 0, leftAt: 1 }), 0, 'off');
   assert.equal(quickLeaveBanMs(cfg(), { userId: 'u', joinedAt: 0, leftAt: 1 }), 0, 'never configured');
+});
+
+test('slowmodeForRate follows the tiers', () => {
+  assert.equal(slowmodeForRate(0), 0);
+  assert.equal(slowmodeForRate(11), 0);
+  assert.equal(slowmodeForRate(12), 2);
+  assert.equal(slowmodeForRate(35), 10);
+  assert.equal(slowmodeForRate(500), 120);
+});
+
+test('nextSlowmode raises fast, lowers slowly, and stays within limits', () => {
+  // Unknown current value: just set it.
+  assert.deepEqual(nextSlowmode({ rate: 25, current: null }), { seconds: 5, lowStreak: 0 });
+  // Busy: raise right away, but not twice within a minute.
+  assert.deepEqual(nextSlowmode({ rate: 50, current: 0, sinceChangeMs: 120_000 }), { seconds: 15, lowStreak: 0 });
+  assert.deepEqual(nextSlowmode({ rate: 50, current: 5, sinceChangeMs: 30_000 }), { seconds: 5, lowStreak: 0 });
+  // Calm: wait for 3 calm checks and 3 minutes since the last change.
+  assert.deepEqual(nextSlowmode({ rate: 0, current: 10, lowStreak: 0, sinceChangeMs: 600_000 }), { seconds: 10, lowStreak: 1 });
+  assert.deepEqual(nextSlowmode({ rate: 0, current: 10, lowStreak: 2, sinceChangeMs: 600_000 }), { seconds: 0, lowStreak: 0 });
+  assert.deepEqual(nextSlowmode({ rate: 0, current: 10, lowStreak: 2, sinceChangeMs: 60_000 }), { seconds: 10, lowStreak: 3 });
+  // A busy check resets the calm streak.
+  assert.deepEqual(nextSlowmode({ rate: 35, current: 10, lowStreak: 2 }), { seconds: 10, lowStreak: 0 });
+  // Limits.
+  assert.equal(nextSlowmode({ rate: 500, current: 0, max: 30 }).seconds, 30);
+  assert.equal(nextSlowmode({ rate: 0, current: 0, min: 3 }).seconds, 3);
+  assert.equal(nextSlowmode({ rate: 0, current: 60, max: 10, sinceChangeMs: 0 }).seconds, 0, 'above a new max: fixed right away');
+});
+
+test('link settings: off by default; send/receive/both; exemptions', () => {
+  assert.deepEqual(linkSettings(cfg()), {
+    bans: 'off',
+    timeouts: 'off',
+    roles: 'off',
+    servers: {},
+    sharedRoles: [],
+    exempt: { roles: [], users: [] },
+  });
+  const c = cfg({ link: { bans: 'both', timeouts: 'send', roles: 'receive', exempt: { roles: ['staff'], users: ['u1'] } } });
+  assert.equal(linkSends(c, 'bans') && linkReceives(c, 'bans'), true);
+  assert.equal(linkSends(c, 'timeouts'), true);
+  assert.equal(linkReceives(c, 'timeouts'), false);
+  assert.equal(linkSends(c, 'roles'), false);
+  assert.equal(linkReceives(c, 'roles'), true);
+  assert.equal(linkExempt(c, 'u1'), true);
+  assert.equal(linkExempt(c, 'u2', ['staff']), true);
+  assert.equal(linkExempt(c, 'u2', ['member']), false);
+});
+
+test('per-server link settings override the defaults for that server only', () => {
+  const c = cfg({ link: { bans: 'both', timeouts: 'off', servers: { B: { bans: 'off', timeouts: 'both' } } } });
+  assert.equal(linkMode(c, 'bans'), 'both', 'default');
+  assert.equal(linkMode(c, 'bans', 'C'), 'both', 'no override for C');
+  assert.equal(linkMode(c, 'bans', 'B'), 'off');
+  assert.equal(linkSends(c, 'timeouts', 'B'), true);
+  assert.equal(linkReceives(c, 'timeouts', 'C'), false);
+  assert.equal(linkMode(c, 'roles', 'B'), 'off', 'not overridden: falls back to the default');
+});
+
+test('slow mode sensitivity scales the steps; calm time controls easing off', () => {
+  assert.equal(slowmodeForRate(12, 'normal'), 2);
+  assert.equal(slowmodeForRate(12, 'low'), 0, 'low needs twice the messages');
+  assert.equal(slowmodeForRate(24, 'low'), 2);
+  assert.equal(slowmodeForRate(6, 'high'), 2, 'high kicks in at half');
+  assert.deepEqual(slowmodeScale('normal').slice(0, 2), [[12, 2], [20, 5]]);
+  assert.deepEqual(slowmodeScale('high').slice(0, 2), [[6, 2], [10, 5]]);
+  assert.deepEqual(slowmodeScale('low').slice(0, 2), [[24, 2], [40, 5]]);
+
+  const calm = { rate: 0, current: 10, sinceChangeMs: 3600_000 };
+  assert.equal(nextSlowmode({ ...calm, calmMinutes: 1, lowStreak: 0 }).seconds, 0, 'eases off after 1 calm minute');
+  assert.equal(nextSlowmode({ ...calm, calmMinutes: 5, lowStreak: 3 }).seconds, 10, 'not yet: 4 of 5');
+  assert.equal(nextSlowmode({ ...calm, calmMinutes: 5, lowStreak: 4 }).seconds, 0);
+});
+
+test('countsForSlowmode skips whitelisted roles and users', () => {
+  const c = cfg({ slowmode: { channels: {}, roles: ['staff'], users: ['u1'] } });
+  assert.equal(countsForSlowmode(c, 'u1'), false);
+  assert.equal(countsForSlowmode(c, 'u2', ['staff']), false);
+  assert.equal(countsForSlowmode(c, 'u2', ['member']), true);
+  assert.equal(countsForSlowmode(cfg(), 'u2'), true, 'nothing set');
+  assert.deepEqual(slowmodeSettings(cfg()), { channels: {}, roles: [], users: [] });
+});
+
+test('sharedRoleChanges only reports roles on the shared list', () => {
+  assert.deepEqual(sharedRoleChanges(['a', 'x'], ['b', 'x', 'y'], ['a', 'b']), { added: ['b'], removed: ['a'] });
+  assert.deepEqual(sharedRoleChanges(['old'], [], ['a']), { added: [], removed: [] }, 'no longer shared: ignored');
+  assert.equal(roleKey('  Verified '), roleKey('verified'));
+});
+
+test('link codes are 8 unambiguous characters and normalize from sloppy input', () => {
+  const code = makeLinkCode(() => new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7]));
+  assert.equal(code, 'ABCD-EFGH');
+  assert.match(makeLinkCode(), /^[A-Z2-9]{4}-[A-Z2-9]{4}$/);
+  assert.equal(normalizeLinkCode(' abcd efgh '), 'ABCD-EFGH');
+  assert.equal(normalizeLinkCode('abcd-efgh'), 'ABCD-EFGH');
 });
 
 test('formatShortDuration', () => {

@@ -26,11 +26,43 @@ function fakeApi({
   perms: permsIn = {},
   rolesAbove = [],
   tempBans = 0,
+  links = [],
+  roleMatches = [],
 } = {}) {
-  const perms = { kick: true, ban: true, manageRoles: true, auditLog: true, rolesAboveBot: rolesAbove, ...permsIn };
-  const state = { cfg: structuredClone(cfg), logs: [] };
+  const perms = {
+    kick: true,
+    ban: true,
+    manageRoles: true,
+    manageChannels: true,
+    moderateMembers: true,
+    auditLog: true,
+    rolesAboveBot: rolesAbove,
+    ...permsIn,
+  };
+  const state = { cfg: structuredClone(cfg), logs: [], slowmodeSet: [], links: links.map((l) => ({ ...l })), joined: [], seeded: [] };
   return {
     state,
+    // Automatic slow mode
+    channelSlowmode: async () => 4,
+    setSlowmode: async (channelId, seconds) => {
+      state.slowmodeSet.push([channelId, seconds]);
+      return true;
+    },
+    messageRate: () => 7,
+    // Linked servers
+    linkCreate: () => ({ code: 'ABCD-EFGH', expiresAt: Date.now() + 3600_000 }),
+    linkJoin: async (code) => {
+      state.joined.push(code);
+      return code === 'GOOD-CODE' ? { id: 'B', name: 'Other server' } : { error: code === 'MINE-HERE' ? 'self' : 'invalid' };
+    },
+    linkList: () => state.links,
+    linkRemove: async (query) => {
+      const match = state.links.find((l) => l.id === query || l.name.toLowerCase() === query.toLowerCase());
+      state.links = state.links.filter((l) => l !== match);
+      return match ?? null;
+    },
+    linkRoleMatches: async () => roleMatches,
+    linkSeedRole: async (roleId) => state.seeded.push(roleId),
     getConfig: () => structuredClone(state.cfg),
     saveConfig: (c) => {
       state.cfg = structuredClone(c);
@@ -621,6 +653,197 @@ test('whitelist and blacklist accept a pasted user ID', async () => {
   assert.match((await runCommand(byId('whitelist', 'add', 'bob'), api)).content, /doesn't look like a user ID/);
   assert.match((await runCommand(byId('whitelist', 'add', id, 'U1'), api)).content, /not both/);
   assert.match((await runCommand(byId('whitelist', 'add'), api)).content, /paste a user ID/);
+});
+
+const groupCmd = (command, group, name, options = [], resolved) => ({
+  guild_id: 'G',
+  member: { user: { id: 'admin' } },
+  data: { name: command, options: [{ type: 2, name: group, options: [{ type: 1, name, options }] }], resolved },
+});
+const linkCmd = (name, options = []) => ({
+  guild_id: 'G',
+  member: { user: { id: 'admin' } },
+  data: { name: 'link', options: [{ type: 1, name, options }] },
+});
+const opt = (name, value, type = 3) => ({ name, type, value });
+
+test('slowmode: add remembers the old value, list shows activity, remove puts it back', async () => {
+  const api = fakeApi();
+  const slow = (name, options) => runCommand(groupCmd('autokick', 'slowmode', name, options), api);
+
+  const added = (await slow('add', [opt('channel', 'C1', 7), opt('max-seconds', 60, 4)])).content;
+  assert.deepEqual(api.state.cfg.slowmode.channels.C1, { min: 0, max: 60, sensitivity: 'normal', calm: 3, original: 4 });
+  assert.match(added, /I'll manage slow mode in <#C1>: \*\*off\*\* when it's quiet, up to \*\*1m\*\* when it's busy, \*\*Normal\*\* sensitivity/);
+  assert.match(added, /Scale: 12\+ messages a minute → 2s, 20\+ → 5s/);
+
+  const updated = (
+    await slow('add', [opt('channel', 'C1', 7), opt('min-seconds', 2, 4), opt('sensitivity', 'high'), opt('calm-minutes', 5, 4)])
+  ).content;
+  assert.deepEqual(
+    api.state.cfg.slowmode.channels.C1,
+    { min: 2, max: 60, sensitivity: 'high', calm: 5, original: 4 },
+    'other settings and the original kept',
+  );
+  assert.match(updated, /Updated slow mode.*\*\*High\*\* sensitivity/s);
+  assert.match(updated, /Scale: 6\+ messages a minute → 2s/);
+  assert.match(updated, /eases off after 5 calm minutes in a row/);
+
+  assert.match((await slow('add', [opt('channel', 'C2', 7), opt('min-seconds', 90, 4)])).content, /can't be more than the maximum/);
+
+  const list = (await slow('list')).embeds[0].fields[0].value;
+  assert.match(list, /<#C1>: 2s to 1m, High sensitivity, eases off after 5 calm minutes\. 7 counted messages/);
+
+  const removed = (await slow('remove', [opt('channel', 'C1', 7)])).content;
+  assert.deepEqual(api.state.slowmodeSet, [['C1', 4]]);
+  assert.match(removed, /back to what it was before \(4s\)/);
+  assert.deepEqual(api.state.cfg.slowmode.channels, {});
+  assert.match((await slow('remove', [opt('channel', 'C1', 7)])).content, /isn't on the slow mode whitelist/);
+});
+
+test("slowmode whitelist: roles and users don't count; settings only for channels; reset restores channels", async () => {
+  const api = fakeApi();
+  const slow = (name, options = [], resolved) => runCommand(groupCmd('autokick', 'slowmode', name, options, resolved), api);
+  const id = '123456789012345678';
+
+  const role = (await slow('add', [opt('target', 'STAFF', 9)], { roles: { STAFF: { id: 'STAFF' } } })).content;
+  assert.match(role, /Messages from <@&STAFF> \(everyone with it\) no longer count/);
+  assert.match(role, /Bypass Slowmode/);
+  await slow('add', [opt('user-id', id)]);
+  assert.deepEqual([api.state.cfg.slowmode.roles, api.state.cfg.slowmode.users], [['STAFF'], [id]]);
+  assert.match((await slow('add', [opt('user-id', id)])).content, /already on the slow mode whitelist/);
+
+  assert.match((await slow('add', [opt('target', 'U1', 9), opt('max-seconds', 10, 4)])).content, /only apply to channels/);
+  assert.match((await slow('add', [opt('channel', 'C1', 7), opt('target', 'U1', 9)])).content, /One at a time/);
+  assert.match((await slow('add')).content, /Pick a channel/);
+
+  const list = (await slow('list')).embeds[0].fields[1].value;
+  assert.equal(list, `<@&STAFF>, <@${id}>`);
+
+  await slow('remove', [opt('user-id', id)]);
+  assert.deepEqual(api.state.cfg.slowmode.users, []);
+
+  await slow('add', [opt('channel', 'C1', 7)]);
+  const reset = (await slow('reset')).content;
+  assert.match(reset, /Cleared the slow mode whitelist \(2 entries\)\. 1 channel got their old slow mode back/);
+  assert.deepEqual(api.state.slowmodeSet, [['C1', 4]]);
+  assert.deepEqual(api.state.cfg.slowmode, { channels: {}, roles: [], users: [] });
+  assert.match((await slow('reset')).content, /already empty/);
+});
+
+test('slowmode warns without Manage Channels', async () => {
+  const api = fakeApi({ perms: { manageChannels: false } });
+  const reply = await runCommand(groupCmd('autokick', 'slowmode', 'add', [opt('channel', 'C1', 7)]), api);
+  assert.match(reply.content, /Manage Channels/);
+});
+
+test('link create and join', async () => {
+  const api = fakeApi();
+  const created = (await runCommand(linkCmd('create'), api)).content;
+  assert.match(created, /Link code: \*\*`ABCD-EFGH`\*\*/);
+  assert.match(created, /\/link join code:ABCD-EFGH/);
+  assert.doesNotMatch(api.state.logs.at(-1), /ABCD/, 'the code itself is not posted in the log');
+
+  assert.match((await runCommand(linkCmd('join', [opt('code', 'GOOD-CODE')]), api)).content, /Linked with \*\*Other server\*\*.*Nothing is shared yet/s);
+  assert.match((await runCommand(linkCmd('join', [opt('code', 'MINE-HERE')]), api)).content, /made in this server/);
+  assert.match((await runCommand(linkCmd('join', [opt('code', 'nope')]), api)).content, /isn't valid or has expired/);
+});
+
+test('link share shows what actually flows and warns about permissions', async () => {
+  const other = { id: 'B', name: 'Other', theirs: { bans: 'receive', timeouts: 'off', roles: 'both' } };
+  const api = fakeApi({ links: [other], perms: { ban: false } });
+  const share = async (kind, mode) => (await runCommand(linkCmd('share', [opt('kind', kind), opt('mode', mode)]), api)).content;
+
+  const bans = await share('bans', 'both');
+  assert.equal(api.state.cfg.link.bans, 'both');
+  assert.match(bans, /\*\*Other\*\*: they accept yours ✅, they don't send theirs \(yet\)/);
+  assert.match(bans, /not AutoKick's own inactivity or quick-leave bans/);
+  assert.match(bans, /don't have the \*\*Ban Members\*\* permission/);
+
+  const roles = await share('roles', 'receive');
+  assert.match(roles, /you get theirs ✅/);
+  assert.match(roles, /No roles are shared yet/);
+
+  const list = (await runCommand(linkCmd('list'), api)).embeds[0];
+  const field = list.fields.find((f) => f.name === 'Other (B)').value;
+  assert.match(field, /Bans: → from here to them/);
+  assert.match(field, /Timeouts: not shared/);
+  assert.match(field, /Roles: ← from them to here/);
+});
+
+test('link share can be set for one linked server, and put back on the default', async () => {
+  const theirs = { bans: 'both', timeouts: 'both', roles: 'off' };
+  const api = fakeApi({ links: [{ id: 'B', name: 'Bee', theirs }, { id: 'C', name: 'Sea', theirs }] });
+  const share = async (kind, mode, server) =>
+    (await runCommand(linkCmd('share', [opt('kind', kind), opt('mode', mode), ...(server ? [opt('server', server)] : [])]), api)).content;
+
+  // Only timeouts with Bee; nothing else, with anyone.
+  const bee = await share('timeouts', 'both', 'bee');
+  assert.deepEqual(api.state.cfg.link.servers, { B: { timeouts: 'both' } });
+  assert.equal(api.state.cfg.link.timeouts ?? 'off', 'off', 'default untouched');
+  assert.match(bee, /Timeouts with \*\*Bee\*\* only: this server sends its own and accepts theirs/);
+  assert.match(bee, /\*\*Bee\*\*: they accept yours ✅, you get theirs ✅/);
+  assert.doesNotMatch(bee, /Sea/);
+
+  const all = await share('bans', 'send');
+  assert.match(all, /by default this server sends its own/);
+  assert.match(all, /\*\*Bee\*\*: they accept yours ✅/);
+  assert.match(all, /\*\*Sea\*\*: they accept yours ✅/);
+
+  await share('bans', 'off', 'B');
+  const timeoutsDefault = await share('timeouts', 'receive');
+  assert.match(timeoutsDefault, /Servers with their own timeouts setting keep it: \*\*Bee\*\*/);
+
+  const fields = Object.fromEntries((await runCommand(linkCmd('list'), api)).embeds[0].fields.map((f) => [f.name, f.value]));
+  assert.match(fields['Bee (B)'], /Bans: not shared/);
+  assert.match(fields['Bee (B)'], /Timeouts: ⇄ both ways/);
+  assert.match(fields['Bee (B)'], /Set just for them here: Timeouts Send \+ receive, Bans Off/);
+  assert.match(fields['Sea (C)'], /Bans: → from here to them/);
+  assert.match(fields['Sea (C)'], /Timeouts: ← from them to here/);
+
+  assert.match(await share('timeouts', 'default', 'Bee'), /follow this server's main setting again: it accepts theirs/);
+  assert.deepEqual(api.state.cfg.link.servers, { B: { bans: 'off' } });
+  await share('bans', 'default', 'B');
+  assert.deepEqual(api.state.cfg.link.servers, {}, 'empty overrides are dropped');
+
+  assert.match(await share('bans', 'default'), /only works together with `server:`/);
+  assert.match(await share('bans', 'both', 'nowhere'), /isn't linked/);
+});
+
+test('link remove by name or ID', async () => {
+  const api = fakeApi({ links: [{ id: 'B', name: 'Other', theirs: {} }] });
+  assert.match((await runCommand(linkCmd('remove', [opt('server', 'nope')]), api)).content, /isn't linked/);
+  assert.match((await runCommand(linkCmd('remove', [opt('server', 'other')]), api)).content, /Unlinked from \*\*Other\*\*/);
+  assert.deepEqual(api.state.links, []);
+});
+
+test('link roles: add seeds and shows matches; remove; list', async () => {
+  const api = fakeApi({ roleMatches: [{ roleId: 'V', name: 'Verified', servers: ['Other'] }] });
+  const roles = (name, role) =>
+    runCommand(groupCmd('link', 'roles', name, role ? [opt('role', role, 8)] : [], { roles: { V: { id: 'V', name: 'Verified' } } }), api);
+
+  const added = (await roles('add', 'V')).content;
+  assert.deepEqual(api.state.cfg.link.sharedRoles, ['V']);
+  assert.deepEqual(api.state.seeded, ['V']);
+  assert.match(added, /shared role named \*\*Verified\*\*/);
+  assert.match(added, /Matches in: Other/);
+  assert.match(added, /Role sharing is off for this server/);
+
+  assert.match((await roles('add', 'V')).content, /already shared/);
+  assert.match((await roles('list')).embeds[0].description, /<@&V>: syncs with Other/);
+  assert.match((await roles('remove', 'V')).content, /no longer shared/);
+  assert.deepEqual(api.state.cfg.link.sharedRoles, []);
+});
+
+test('link exempt takes roles, members and user IDs', async () => {
+  const api = fakeApi();
+  const id = '123456789012345678';
+  await runCommand(groupCmd('link', 'exempt', 'add', [opt('target', 'STAFF', 9)], { roles: { STAFF: { id: 'STAFF' } } }), api);
+  await runCommand(groupCmd('link', 'exempt', 'add', [opt('user-id', id)]), api);
+  assert.deepEqual(api.state.cfg.link.exempt, { roles: ['STAFF'], users: [id] });
+  assert.match((await runCommand(groupCmd('link', 'exempt', 'list'), api)).embeds[0].description, /<@&STAFF>, <@123456789012345678>/);
+  await runCommand(groupCmd('link', 'exempt', 'remove', [opt('user-id', id)]), api);
+  assert.deepEqual(api.state.cfg.link.exempt.users, []);
+  assert.match((await runCommand(groupCmd('link', 'exempt', 'reset'), api)).content, /Cleared the exempt list \(1 entry\)/);
 });
 
 test('check explains protection', async () => {

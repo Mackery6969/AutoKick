@@ -2,8 +2,19 @@
 // Handlers only talk to the `api` object the Durable Object passes in, so they
 // can be tested without Discord or Cloudflare.
 
-import { ACTION_DONE, actionOf, DAY_MS, escapeMarkdown, formatDuration } from './policy.js';
+import {
+  ACTION_DONE,
+  actionOf,
+  DAY_MS,
+  escapeMarkdown,
+  formatDuration,
+  slowmodeScale,
+  slowmodeSettings,
+} from './policy.js';
 import { snowflakeTime } from './discord.js';
+import { LINK_COMMAND, runLinkCommand } from './link-commands.js';
+import { MAX_SLOWMODE_CHANNELS } from './slowmode.js';
+import { formatList, resolveTarget, targetOptions } from './targets.js';
 
 const SUB = 1;
 const GROUP = 2;
@@ -17,10 +28,7 @@ const MANAGE_GUILD = String(1 << 5);
 const COLOR = 0x5865f2;
 
 function listGroup(name, description) {
-  const target = (verb) => [
-    { type: MENTIONABLE, name: 'target', description: `Role or member to ${verb}` },
-    { type: STRING, name: 'user-id', description: `Or the ID of a user to ${verb} (works for people not in the server)` },
-  ];
+  const target = (verb) => targetOptions(verb, MENTIONABLE, STRING);
   return {
     type: GROUP,
     name,
@@ -67,6 +75,14 @@ const ACTION_CHOICES = [
   { name: 'Give/take roles (set them with /autokick inactive-roles)', value: 'role' },
   { name: 'Temporary ban (unbanned automatically)', value: 'tempban' },
   { name: 'Soft ban (kick + delete their last 7 days of messages)', value: 'softban' },
+];
+
+// Text, voice and stage channels (the ones with a chat that slow mode applies to).
+const SLOWMODE_CHANNEL_TYPES = [0, 2, 13];
+
+const slowmodeTargetOptions = (verb) => [
+  { type: CHANNEL, name: 'channel', description: `Channel to ${verb}`, channel_types: SLOWMODE_CHANNEL_TYPES },
+  ...targetOptions(verb, MENTIONABLE, STRING),
 ];
 
 const roleOption = (description) => [{ type: ROLE, name: 'role', description, required: true }];
@@ -198,8 +214,45 @@ export const COMMANDS = [
           { type: SUB, name: 'list', description: 'Show pause roles' },
         ],
       },
+      {
+        type: GROUP,
+        name: 'slowmode',
+        description: "Automatic slow mode whitelist: channels it runs in, roles/users whose messages don't count",
+        options: [
+          {
+            type: SUB,
+            name: 'add',
+            description: "Whitelist a channel (to manage) or a role/member (their messages don't count)",
+            options: [
+              ...slowmodeTargetOptions('add'),
+              { type: INTEGER, name: 'min-seconds', description: 'Channels: slow mode when chat is quiet (default 0 = off)', min_value: 0, max_value: 21600 },
+              { type: INTEGER, name: 'max-seconds', description: 'Channels: most slow mode when chat is busiest (default 30)', min_value: 1, max_value: 21600 },
+              {
+                type: STRING,
+                name: 'sensitivity',
+                description: 'Channels: how easily it kicks in (default Normal)',
+                choices: [
+                  { name: 'Low (needs twice as many messages)', value: 'low' },
+                  { name: 'Normal', value: 'normal' },
+                  { name: 'High (kicks in at half as many messages)', value: 'high' },
+                ],
+              },
+              { type: INTEGER, name: 'calm-minutes', description: 'Channels: calm minutes before it eases off (default 3)', min_value: 1, max_value: 30 },
+            ],
+          },
+          {
+            type: SUB,
+            name: 'remove',
+            description: 'Take a channel, role or member off the slow mode whitelist',
+            options: slowmodeTargetOptions('remove'),
+          },
+          { type: SUB, name: 'list', description: 'Show the slow mode whitelist and how busy each channel is' },
+          { type: SUB, name: 'reset', description: 'Clear the slow mode whitelist (channels get their old slow mode back)' },
+        ],
+      },
     ],
   },
+  LINK_COMMAND,
   {
     name: 'activity',
     description: 'See when you or another member was last active',
@@ -247,17 +300,6 @@ const NO_BAN_PERMISSION =
 const NO_AUDIT_LOG =
   "⚠️ I can't see the audit log, so people a moderator (or a verification bot) kicks soon after they join " +
   'get banned too. Give my role **View Audit Log** so I can tell them apart.';
-
-function formatList(list) {
-  const items = [...list.roles.map((id) => `<@&${id}>`), ...list.users.map((id) => `<@${id}>`)];
-  if (!items.length) return 'None';
-  let text = '';
-  for (const [i, item] of items.entries()) {
-    if (text.length + item.length > 950) return `${text} …and ${items.length - i} more`;
-    text += (text ? ', ' : '') + item;
-  }
-  return text;
-}
 
 function formatPauseRoles(cfg, detected = []) {
   const items = [
@@ -898,23 +940,13 @@ async function editList({ api, opts, interaction, userId }, listName, action) {
   }
 
   // Either a picked role/member, or a pasted user ID (for someone who isn't in the server).
-  const rawId = opts['user-id']?.trim();
-  if (opts.target && rawId) return { content: '❌ Pick a role or member, **or** paste a user ID, not both.' };
-  if (!opts.target && !rawId) return { content: '❌ Pick a role or member, or paste a user ID.' };
-  const id = opts.target ?? rawId.replace(/^<@!?(\d+)>$/, '$1');
-  if (!opts.target && !/^\d{17,20}$/.test(id)) {
-    return {
-      content:
-        "❌ That doesn't look like a user ID. In Discord, turn on Developer Mode (User Settings → Advanced), " +
-        'then right-click the user and choose **Copy User ID**.',
-    };
-  }
-  const isRole = Boolean(opts.target && interaction.data.resolved?.roles?.[id]);
+  const target = resolveTarget(opts, interaction);
+  if (target.error) return { content: target.error };
+  const { id, isRole, mention } = target;
   if (id === interaction.guild_id) {
     return { content: "@everyone can't go on a list. To stop all kicks, use `/autokick disable`." };
   }
   const kind = isRole ? 'roles' : 'users';
-  const mention = isRole ? `<@&${id}>` : opts.target ? `<@${id}>` : `<@${id}> (ID \`${id}\`)`;
   const other = listName === 'whitelist' ? 'blacklist' : 'whitelist';
   const list = cfg[listName][kind];
 
@@ -983,6 +1015,159 @@ async function editPauseRoles({ api, opts, interaction, userId }, action) {
   await api.log(`⚙️ <@${userId}> removed ${mention} as a pause role.`).catch(() => {});
   const still = detected.includes(id) ? ' It still counts automatically because of its name.' : '';
   return { content: `✅ ${mention} is no longer a pause role.${still}` };
+}
+
+const seconds = (n) => (n === 0 ? 'off' : n < 60 || n % 60 ? `${n}s` : `${n / 60}m`);
+const SENSITIVITY_LABEL = { low: 'Low', normal: 'Normal', high: 'High' };
+const scaleText = (sensitivity) =>
+  slowmodeScale(sensitivity)
+    .map(([messages, s], i) => `${messages}+${i === 0 ? ' messages a minute' : ''} → ${seconds(s)}`)
+    .join(', ');
+const CHANNEL_SETTINGS = ['min-seconds', 'max-seconds', 'sensitivity', 'calm-minutes'];
+const BYPASS_TIP =
+  "They're still slowed like everyone else. To let them skip slow mode too, give them Discord's **Bypass Slowmode** " +
+  'permission (Server Settings → Roles, or the channel\'s permissions).';
+
+/** Restore a channel's slow mode to what it was before the bot managed it. Returns true if it worked. */
+const restoreSlowmode = (api, channelId, entry) =>
+  api.setSlowmode(channelId, entry.original ?? 0, 'AutoKick: automatic slow mode turned off').catch(() => false);
+
+/**
+ * /autokick slowmode: one whitelist. Channels on it get automatic slow mode;
+ * messages from roles and users on it don't count toward how busy chat is.
+ */
+async function editSlowmode({ api, opts, interaction, userId }, sub) {
+  const cfg = api.getConfig();
+  const settings = slowmodeSettings(cfg);
+  const save = () => {
+    cfg.slowmode = settings;
+    api.saveConfig(cfg);
+  };
+
+  if (sub === 'list') {
+    const lines = Object.entries(settings.channels).map(([id, c]) => {
+      const sensitivity = c.sensitivity ?? 'normal';
+      return (
+        `• <#${id}>: ${seconds(c.min ?? 0)} to ${seconds(c.max ?? 30)}, ${SENSITIVITY_LABEL[sensitivity]} sensitivity, ` +
+        `eases off after ${plural(c.calm ?? 3, 'calm minute')}. ${api.messageRate(id)} counted messages in the last minute.`
+      );
+    });
+    return {
+      embeds: [
+        {
+          title: 'Automatic slow mode whitelist',
+          color: COLOR,
+          fields: [
+            { name: 'Channels (slow mode follows how busy they are)', value: (lines.join('\n') || 'None yet. Add one with `/autokick slowmode add channel:`.').slice(0, 1024) },
+            { name: "Roles and members (their messages don't count)", value: formatList(settings) },
+          ],
+          footer: { text: `Normal scale: ${scaleText('normal')}. High sensitivity needs half the messages, Low twice as many.` },
+        },
+      ],
+    };
+  }
+
+  if (sub === 'reset') {
+    const channelIds = Object.keys(settings.channels);
+    const count = channelIds.length + settings.roles.length + settings.users.length;
+    if (!count) return { content: 'The slow mode whitelist is already empty.' };
+    let restored = 0;
+    for (const id of channelIds) if (await restoreSlowmode(api, id, settings.channels[id])) restored += 1;
+    cfg.slowmode = { channels: {}, roles: [], users: [] };
+    api.saveConfig(cfg);
+    await api.log(`⚙️ <@${userId}> cleared the slow mode whitelist.`).catch(() => {});
+    const failed = channelIds.length - restored;
+    return {
+      content:
+        `✅ Cleared the slow mode whitelist (${count} ${count === 1 ? 'entry' : 'entries'}). ` +
+        (channelIds.length ? `${plural(restored, 'channel')} got their old slow mode back.` : '') +
+        (failed ? ` ${plural(failed, 'channel')} couldn't be put back, so check them by hand.` : ''),
+    };
+  }
+
+  // add / remove: a channel, or a role/member/user ID.
+  const channelId = opts.channel;
+  if (channelId && (opts.target || opts['user-id'])) {
+    return { content: '❌ One at a time: a channel, **or** a role/member/user ID.' };
+  }
+  if (!channelId && !opts.target && !opts['user-id']) {
+    return { content: '❌ Pick a channel, a role or member, or paste a user ID.' };
+  }
+  if (!channelId && CHANNEL_SETTINGS.some((name) => opts[name] !== undefined)) {
+    return { content: '❌ `min-seconds`, `max-seconds`, `sensitivity` and `calm-minutes` only apply to channels.' };
+  }
+
+  if (!channelId) {
+    const target = resolveTarget(opts, interaction);
+    if (target.error) return { content: target.error };
+    if (target.id === interaction.guild_id) return { content: "@everyone can't go on the slow mode whitelist." };
+    const kind = target.isRole ? 'roles' : 'users';
+    const listed = settings[kind].includes(target.id);
+    if (sub === 'add') {
+      if (listed) return { content: `${target.mention} is already on the slow mode whitelist.` };
+      settings[kind] = [...settings[kind], target.id];
+      save();
+      await api.log(`⚙️ <@${userId}> added ${target.mention} to the slow mode whitelist.`).catch(() => {});
+      return {
+        content:
+          `✅ Messages from ${target.mention}${target.isRole ? ' (everyone with it)' : ''} no longer count toward how busy chat is, ` +
+          `so they can't set off slow mode.\n${BYPASS_TIP}`,
+      };
+    }
+    if (!listed) return { content: `${target.mention} isn't on the slow mode whitelist.` };
+    settings[kind] = settings[kind].filter((x) => x !== target.id);
+    save();
+    await api.log(`⚙️ <@${userId}> removed ${target.mention} from the slow mode whitelist.`).catch(() => {});
+    return { content: `✅ Messages from ${target.mention} count toward how busy chat is again.` };
+  }
+
+  if (sub === 'remove') {
+    const entry = settings.channels[channelId];
+    if (!entry) return { content: `<#${channelId}> isn't on the slow mode whitelist.` };
+    delete settings.channels[channelId];
+    save();
+    await api.log(`⚙️ <@${userId}> turned off automatic slow mode in <#${channelId}>.`).catch(() => {});
+    return {
+      content:
+        `✅ Automatic slow mode is off in <#${channelId}>. ` +
+        ((await restoreSlowmode(api, channelId, entry))
+          ? `Slow mode is back to what it was before (${seconds(entry.original ?? 0)}).`
+          : "I couldn't put its slow mode back, so set it by hand if needed."),
+    };
+  }
+
+  // Add a channel, or change its settings.
+  const existing = settings.channels[channelId];
+  if (!existing && Object.keys(settings.channels).length >= MAX_SLOWMODE_CHANNELS) {
+    return { content: `❌ Up to ${MAX_SLOWMODE_CHANNELS} channels can have automatic slow mode.` };
+  }
+  const min = opts['min-seconds'] ?? existing?.min ?? 0;
+  const max = opts['max-seconds'] ?? existing?.max ?? 30;
+  const sensitivity = opts.sensitivity ?? existing?.sensitivity ?? 'normal';
+  const calm = opts['calm-minutes'] ?? existing?.calm ?? 3;
+  if (min > max) return { content: `❌ The minimum (${seconds(min)}) can't be more than the maximum (${seconds(max)}).` };
+  const original = existing ? existing.original : await api.channelSlowmode(channelId).catch(() => 0);
+  settings.channels[channelId] = { min, max, sensitivity, calm, original };
+  save();
+  await api
+    .log(
+      `⚙️ <@${userId}> ${existing ? 'changed' : 'turned on'} automatic slow mode in <#${channelId}> ` +
+        `(${seconds(min)} to ${seconds(max)}, ${SENSITIVITY_LABEL[sensitivity]} sensitivity).`,
+    )
+    .catch(() => {});
+
+  const lines = [
+    `✅ ${existing ? 'Updated' : "I'll manage"} slow mode in <#${channelId}>: **${seconds(min)}** when it's quiet, ` +
+      `up to **${seconds(max)}** when it's busy, **${SENSITIVITY_LABEL[sensitivity]}** sensitivity.`,
+    `Scale: ${scaleText(sensitivity)}. It goes up within a minute of chat speeding up and eases off after ` +
+      `${plural(calm, 'calm minute')} in a row.`,
+    'If a moderator changes the slow mode by hand, I leave that channel alone for 30 minutes.',
+  ];
+  const perms = await api.botPermissions().catch(() => null);
+  if (perms && !perms.manageChannels) {
+    lines.push("⚠️ I don't have the **Manage Channels** permission, so I can't change slow mode yet. Give my role Manage Channels.");
+  }
+  return { content: lines.join('\n') };
 }
 
 /** /autokick inactive-roles: which roles the role action gives and takes. */
@@ -1163,8 +1348,10 @@ export async function runCommand(interaction, api) {
     userId: interaction.member?.user?.id,
     opts: Object.fromEntries((sub?.options ?? []).map((o) => [o.name, o.value])),
   };
+  if (interaction.data.name === 'link') return runLinkCommand(ctx, group, sub?.name);
   if (group === 'pause') return editPauseRoles(ctx, sub.name);
   if (group === 'inactive-roles') return editInactiveRoles(ctx, sub.name);
+  if (group === 'slowmode') return editSlowmode(ctx, sub.name);
   if (Object.hasOwn(CHANNEL_LISTS, group ?? '')) return editChannelList(ctx, group, sub.name);
   if (group) return editList(ctx, group, sub.name);
   const handler = handlers[sub.name];
