@@ -50,18 +50,18 @@ These are extras, separate from inactivity kicks. **Every one is off until you s
 
 | Feature | Off until |
 | --- | --- |
-| [Quick-leave bans](#quick-leave-bans) | `/autokick quickleave` gets `minutes` above 0 |
-| [Automatic slow mode](#automatic-slow-mode) | a channel is added with `/autokick slowmode add channel:` |
+| [Quick-leave bans](#quick-leave-bans) | `/quickleave` gets `minutes` above 0 |
+| [Automatic slow mode](#automatic-slow-mode) | a channel is added with `/slowmode add channel:` |
 | [Linked servers](#linked-servers) | two servers link with `/link create` + `/link join` **and** both turn sharing on with `/link share` |
 
 ### Quick-leave bans
 
-`/autokick quickleave minutes:10 ban-days:7` bans anyone who leaves within 10 minutes of joining for 7 days, then unbans them automatically. `minutes:0` turns it off.
+`/quickleave minutes:10 ban-days:7` bans anyone who leaves within 10 minutes of joining for 7 days, then unbans them automatically. `minutes:0` turns it off, and `/quickleave` on its own shows the current setting and how many people are banned right now.
 
 - It stops the same people from bouncing in and out again. It can't stop someone's first join and leave, because they're already gone by then.
-- Never banned: bots and whitelisted members. Someone who rejoins before the ban goes out (within about a minute) isn't banned.
+- Never banned: bots and members on the `/autokick` whitelist. Someone who rejoins before the ban goes out (within about a minute) isn't banned.
 - People kicked by a moderator or another bot (a verification bot, say) aren't banned, as long as the bot has **View Audit Log** so it can tell a kick from a leave.
-- The bot needs **Ban Members**. `/autokick status` warns if either permission is missing.
+- The bot needs **Ban Members**. `/quickleave` warns if either permission is missing.
 - Bans show up in Server Settings → Bans with the date they end. Unban someone there to let them back early. If a moderator replaces the ban with their own, the bot leaves it in place.
 - Bans and unbans are posted in the log channel.
 
@@ -69,7 +69,7 @@ These are extras, separate from inactivity kicks. **Every one is off until you s
 
 Automatic slow mode has one **whitelist**, which takes channels, roles and users:
 
-- **Channels** on it get automatic slow mode: `/autokick slowmode add channel:#general`. Nothing else is touched.
+- **Channels** on it get automatic slow mode: `/slowmode add channel:#general`. Nothing else is touched.
 - **Roles and users** on it (`target:` or `user-id:`) don't count toward how busy chat is, so staff or a chatty bot can't set it off. They're still slowed like everyone else. To let them skip slow mode too, give them Discord's **Bypass Slowmode** permission yourself.
 
 The slow mode follows how many messages were sent in the last minute:
@@ -118,7 +118,9 @@ The bot needs **Ban Members**, **Moderate Members** and/or **Manage Roles** in t
 
 ## Commands
 
-The `/autokick` and `/link` commands can only be seen and used by members with **Manage Server** by default (`/activity` and `/ping` are for everyone). You can change that in Server Settings → Integrations.
+`/autokick`, `/slowmode`, `/quickleave` and `/link` can only be seen and used by members with **Manage Server** by default (`/activity` and `/ping` are for everyone). You can change that per command in Server Settings → Integrations.
+
+**Inactivity kicks** (`/autokick`):
 
 | Command | What it does |
 | --- | --- |
@@ -131,19 +133,29 @@ The `/autokick` and `/link` commands can only be seen and used by members with *
 | `/autokick action type: [ban-days:]` | What happens to inactive members: kick (default), give/take roles, temporary ban, or soft ban |
 | `/autokick inactive-roles give/take/unset/list/reset` | Roles given to or taken from inactive members (for the give/take roles action) |
 | `/autokick warn days:` | DM members this many days before they're kicked (0 = off, the default) |
-| `/autokick quickleave minutes: [ban-days:]` | Temporarily ban people who leave within that many minutes of joining (0 = off, the default; ban 7 days unless set) |
-| `/autokick logchannel [channel:]` | Post kicks, warnings, bans and setting changes in a channel (leave empty to turn off) |
+| `/autokick logchannel [channel:]` | Post kicks, warnings, bans and setting changes in a channel, for every feature (leave empty to turn off) |
 | `/autokick whitelist add/remove/list/reset` | Roles or members that are never kicked. `add`/`remove` take a role or member, or a `user-id` for someone not in the server |
 | `/autokick blacklist add/remove/list/reset` | Roles or members that can be kicked even if they have a whitelisted role (same options as the whitelist) |
 | `/autokick channel-whitelist add/remove/list/reset` | If set, only activity in these channels/categories counts |
 | `/autokick channel-blacklist add/remove/list/reset` | Activity in these channels/categories doesn't count |
 | `/autokick pause add/remove/list` | Roles that pause a member's clock while they have them (timeouts always do) |
-| `/autokick slowmode add/remove/list/reset` | Slow mode whitelist: channels that get automatic slow mode (with `min-seconds`, `max-seconds`, `sensitivity`, `calm-minutes`), and roles/users whose messages don't count |
+
+**Bonus features** (each its own command, all off by default):
+
+| Command | What it does |
+| --- | --- |
+| `/quickleave [minutes:] [ban-days:]` | Temporarily ban people who leave within that many minutes of joining. `minutes:0` turns it off; no options shows the current setting |
+| `/slowmode add/remove/list/reset` | Slow mode whitelist: channels that get automatic slow mode (with `min-seconds`, `max-seconds`, `sensitivity`, `calm-minutes`), and roles/users whose messages don't count |
 | `/link create` / `/link join code:` | Link two servers (one makes a code, the other redeems it) |
 | `/link share kind: mode: [server:]` | Send, receive, both or neither, for bans, timeouts and roles (for every linked server, or just one) |
 | `/link list` / `/link remove server:` | What's shared with each linked server / unlink one |
 | `/link roles add/remove/list` | Roles kept in sync with same-named roles in linked servers |
 | `/link exempt add/remove/list/reset` | Roles and members linked servers never touch |
+
+**For everyone:**
+
+| Command | What it does |
+| --- | --- |
 | `/activity [member:]` | When you (or another member) last sent a message or was in voice (anyone can use it) |
 | `/ping` | Check the bot is online and replying (anyone can use it) |
 

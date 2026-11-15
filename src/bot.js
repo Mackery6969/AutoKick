@@ -961,8 +961,6 @@ export class AutoKickBot extends DurableObject {
       detectedPauseRoles: detectedPauseRoleIds(meta),
       botCanAct: botHasPermission(meta, botMember, PERM_FOR_ACTION[action.type] ?? PERM_KICK_MEMBERS),
       rolesAboveBot: action.type === 'role' ? rolesAboveBot(meta, botMember, [...action.give, ...action.take]) : [],
-      botCanBan: botHasPermission(meta, botMember, PERM_BAN_MEMBERS),
-      botCanViewAuditLog: botHasPermission(meta, botMember, PERM_VIEW_AUDIT_LOG),
     };
   }
 
@@ -1599,7 +1597,8 @@ export class AutoKickBot extends DurableObject {
       linkRemove: (query, userId) => this.unlink(guildId, query, userId, budget),
       linkRoleMatches: () => this.linkRoleMatches(guildId, budget),
       linkSeedRole: (roleId) => this.seedSharedRole(guildId, roleId, budget),
-      tempBanCount: () => this.sql.exec('SELECT COUNT(*) AS n FROM temp_bans WHERE guild_id = ?', guildId).toArray()[0].n,
+      quickLeaveBanCount: () =>
+        this.sql.exec("SELECT COUNT(*) AS n FROM temp_bans WHERE guild_id = ? AND kind = 'quickleave'", guildId).toArray()[0].n,
       log: (content) => this.log(guildId, content, budget),
       nextSweepAt: () => (this.getState('sweepQueue') ? Date.now() : this.getState('nextSweepAt', Date.now())),
       connected: () => this.ready,

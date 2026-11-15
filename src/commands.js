@@ -162,28 +162,6 @@ export const COMMANDS = [
       },
       {
         type: SUB,
-        name: 'quickleave',
-        description: 'Temporarily ban people who leave right after joining (minutes 0 turns it off)',
-        options: [
-          {
-            type: INTEGER,
-            name: 'minutes',
-            description: 'Leaving within this many minutes of joining counts (0 = off)',
-            required: true,
-            min_value: 0,
-            max_value: 1440,
-          },
-          {
-            type: INTEGER,
-            name: 'ban-days',
-            description: 'How many days the ban lasts (default 7)',
-            min_value: 1,
-            max_value: 365,
-          },
-        ],
-      },
-      {
-        type: SUB,
         name: 'logchannel',
         description: 'Set where kicks are logged (leave empty to turn logging off)',
         options: [
@@ -214,41 +192,68 @@ export const COMMANDS = [
           { type: SUB, name: 'list', description: 'Show pause roles' },
         ],
       },
+    ],
+  },
+
+  // ---- Bonus features: separate from inactivity kicks, each off until set up.
+  {
+    name: 'slowmode',
+    description: "Automatic slow mode: whitelisted channels slow down when chat gets busy",
+    default_member_permissions: MANAGE_GUILD,
+    contexts: [0],
+    integration_types: [0],
+    options: [
       {
-        type: GROUP,
-        name: 'slowmode',
-        description: "Automatic slow mode whitelist: channels it runs in, roles/users whose messages don't count",
+        type: SUB,
+        name: 'add',
+        description: "Whitelist a channel (to manage) or a role/member (their messages don't count)",
         options: [
+          ...slowmodeTargetOptions('add'),
+          { type: INTEGER, name: 'min-seconds', description: 'Channels: slow mode when chat is quiet (default 0 = off)', min_value: 0, max_value: 21600 },
+          { type: INTEGER, name: 'max-seconds', description: 'Channels: most slow mode when chat is busiest (default 30)', min_value: 1, max_value: 21600 },
           {
-            type: SUB,
-            name: 'add',
-            description: "Whitelist a channel (to manage) or a role/member (their messages don't count)",
-            options: [
-              ...slowmodeTargetOptions('add'),
-              { type: INTEGER, name: 'min-seconds', description: 'Channels: slow mode when chat is quiet (default 0 = off)', min_value: 0, max_value: 21600 },
-              { type: INTEGER, name: 'max-seconds', description: 'Channels: most slow mode when chat is busiest (default 30)', min_value: 1, max_value: 21600 },
-              {
-                type: STRING,
-                name: 'sensitivity',
-                description: 'Channels: how easily it kicks in (default Normal)',
-                choices: [
-                  { name: 'Low (needs twice as many messages)', value: 'low' },
-                  { name: 'Normal', value: 'normal' },
-                  { name: 'High (kicks in at half as many messages)', value: 'high' },
-                ],
-              },
-              { type: INTEGER, name: 'calm-minutes', description: 'Channels: calm minutes before it eases off (default 3)', min_value: 1, max_value: 30 },
+            type: STRING,
+            name: 'sensitivity',
+            description: 'Channels: how easily it kicks in (default Normal)',
+            choices: [
+              { name: 'Low (needs twice as many messages)', value: 'low' },
+              { name: 'Normal', value: 'normal' },
+              { name: 'High (kicks in at half as many messages)', value: 'high' },
             ],
           },
-          {
-            type: SUB,
-            name: 'remove',
-            description: 'Take a channel, role or member off the slow mode whitelist',
-            options: slowmodeTargetOptions('remove'),
-          },
-          { type: SUB, name: 'list', description: 'Show the slow mode whitelist and how busy each channel is' },
-          { type: SUB, name: 'reset', description: 'Clear the slow mode whitelist (channels get their old slow mode back)' },
+          { type: INTEGER, name: 'calm-minutes', description: 'Channels: calm minutes before it eases off (default 3)', min_value: 1, max_value: 30 },
         ],
+      },
+      {
+        type: SUB,
+        name: 'remove',
+        description: 'Take a channel, role or member off the slow mode whitelist',
+        options: slowmodeTargetOptions('remove'),
+      },
+      { type: SUB, name: 'list', description: 'Show the slow mode whitelist and how busy each channel is' },
+      { type: SUB, name: 'reset', description: 'Clear the slow mode whitelist (channels get their old slow mode back)' },
+    ],
+  },
+  {
+    name: 'quickleave',
+    description: 'Temporarily ban people who leave right after joining. Run it with no options to see the setting',
+    default_member_permissions: MANAGE_GUILD,
+    contexts: [0],
+    integration_types: [0],
+    options: [
+      {
+        type: INTEGER,
+        name: 'minutes',
+        description: 'Leaving within this many minutes of joining counts (0 = off)',
+        min_value: 0,
+        max_value: 1440,
+      },
+      {
+        type: INTEGER,
+        name: 'ban-days',
+        description: 'How many days the ban lasts (default 7)',
+        min_value: 1,
+        max_value: 365,
       },
     ],
   },
@@ -273,7 +278,8 @@ export const COMMAND_NAMES = new Set(COMMANDS.map((c) => c.name));
 // ---------------------------------------------------------------- helpers
 
 const ts = (ms, style = 'R') => `<t:${Math.floor(ms / 1000)}:${style}>`;
-const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+/** "1 day" / "3 days"; with `many`, the plural is given in full ("1 person is" / "3 people are"). */
+const plural = (n, word, many = null) => `${n} ${n === 1 ? word : (many ?? `${word}s`)}`;
 
 function tally(results) {
   return {
@@ -287,12 +293,6 @@ function tally(results) {
 const warnSetting = (cfg) => (cfg.warnDays ? `${plural(cfg.warnDays, 'day')} before a kick` : 'Off');
 
 const quickLeaveOf = (cfg) => cfg.quickLeave ?? { minutes: 0, banDays: 7 };
-
-function quickLeaveSetting(cfg, active) {
-  const { minutes, banDays } = quickLeaveOf(cfg);
-  if (!minutes) return 'Off';
-  return `Leave within ${plural(minutes, 'minute')} → ${banDays}-day ban (${active} banned right now)`;
-}
 
 const NO_BAN_PERMISSION =
   "⚠️ I don't have the **Ban Members** permission, so quick-leave bans can't happen. " +
@@ -519,10 +519,9 @@ const handlers = {
 
   async status({ api }) {
     const assessed = await api.assessGuild();
-    const { cfg, results, detectedPauseRoles, botCanBan, botCanViewAuditLog } = assessed;
+    const { cfg, results, detectedPauseRoles } = assessed;
     const { due, waiting, blocked } = tally(results);
     const w = actionWords(cfg);
-    const quickLeaveOn = Boolean(quickLeaveOf(cfg).minutes);
     const pastNotes = [];
     if (waiting.length) pastNotes.push(`${waiting.length} still in their warning period`);
     if (blocked.length) pastNotes.push(`+${blocked.length} I can't ${w.verb}`);
@@ -554,7 +553,6 @@ const handlers = {
         ...(w.action.type === 'role' || marked
           ? [{ name: 'Marked inactive (roles changed)', value: String(marked), inline: true }]
           : []),
-        { name: 'Quick-leave bans', value: quickLeaveSetting(cfg, api.tempBanCount()) },
         { name: 'Whitelist (never kicked)', value: formatList(cfg.whitelist) },
         { name: 'Blacklist (kickable even with a whitelisted role)', value: formatList(cfg.blacklist) },
         { name: 'Pause roles (plus anyone timed out)', value: formatPauseRoles(cfg, detectedPauseRoles) },
@@ -570,8 +568,6 @@ const handlers = {
     const warnings = [];
     if (!api.connected()) warnings.push(NOT_CONNECTED);
     if (powerWarning) warnings.push(powerWarning);
-    if (quickLeaveOn && botCanBan === false) warnings.push(NO_BAN_PERMISSION);
-    else if (quickLeaveOn && botCanViewAuditLog === false) warnings.push(NO_AUDIT_LOG);
     if (hidden?.length) {
       warnings.push(
         `⚠️ I can't see ${plural(hidden.length, 'channel')}, so activity there isn't tracked and people ` +
@@ -791,41 +787,6 @@ const handlers = {
     return { content: lines.join('\n') };
   },
 
-  async quickleave({ api, opts, userId }) {
-    const cfg = api.getConfig();
-    const previous = quickLeaveOf(cfg);
-    const minutes = opts.minutes;
-    const banDays = opts['ban-days'] ?? previous.banDays;
-
-    if (!minutes) {
-      if (!previous.minutes) return { content: 'Quick-leave bans are already **off**.' };
-      cfg.quickLeave = { ...previous, minutes: 0 };
-      api.saveConfig(cfg);
-      await api.log(`⚙️ Quick-leave bans turned off by <@${userId}>.`).catch(() => {});
-      return { content: '✅ Quick-leave bans are **off**. Bans already placed still end on their own date.' };
-    }
-
-    cfg.quickLeave = { minutes, banDays };
-    api.saveConfig(cfg);
-    await api
-      .log(
-        `⚙️ Quick-leave bans set by <@${userId}>: leaving within ${plural(minutes, 'minute')} of joining ` +
-          `means a ${banDays}-day ban.`,
-      )
-      .catch(() => {});
-
-    const lines = [
-      `✅ Anyone who leaves within **${plural(minutes, 'minute')}** of joining gets banned for **${plural(banDays, 'day')}**, ` +
-        "then unbanned automatically. This works whether or not inactivity kicks are on.",
-      'Bots and whitelisted members are never banned. Bans show up in Server Settings → Bans with the date they end; ' +
-        'unban someone there to let them back early.',
-    ];
-    const perms = await api.botPermissions().catch(() => null);
-    if (perms && !perms.ban) lines.push(NO_BAN_PERMISSION);
-    else if (perms && !perms.auditLog) lines.push(NO_AUDIT_LOG);
-    return { content: lines.join('\n') };
-  },
-
   async action({ api, opts, userId }) {
     const cfg = api.getConfig();
     const previous = actionOf(cfg);
@@ -1018,6 +979,75 @@ async function editPauseRoles({ api, opts, interaction, userId }, action) {
 }
 
 const seconds = (n) => (n === 0 ? 'off' : n < 60 || n % 60 ? `${n}s` : `${n / 60}m`);
+// ---------------------------------------------------------------- /quickleave
+
+async function quickLeavePermissionWarning(api) {
+  const perms = await api.botPermissions().catch(() => null);
+  if (perms && !perms.ban) return NO_BAN_PERMISSION;
+  if (perms && !perms.auditLog) return NO_AUDIT_LOG;
+  return null;
+}
+
+/**
+ * /quickleave: temporarily ban people who leave right after joining.
+ * No options shows the setting; minutes:0 turns it off; ban-days alone changes the ban length.
+ */
+async function quickleave({ api, opts, userId }) {
+  const cfg = api.getConfig();
+  const previous = quickLeaveOf(cfg);
+  const banDays = opts['ban-days'] ?? previous.banDays;
+  const warning = () => quickLeavePermissionWarning(api);
+
+  if (opts.minutes === undefined && opts['ban-days'] === undefined) {
+    const lines = [
+      previous.minutes
+        ? `Quick-leave bans are **on**: leaving within **${plural(previous.minutes, 'minute')}** of joining means a ` +
+          `**${previous.banDays}-day** ban. ${plural(api.quickLeaveBanCount(), 'person is', 'people are')} banned right now.`
+        : 'Quick-leave bans are **off**. Turn them on with `/quickleave minutes:10` (and optionally `ban-days:`).',
+    ];
+    if (previous.minutes) {
+      const w = await warning();
+      if (w) lines.push(w);
+    }
+    return { content: lines.join('\n') };
+  }
+
+  const minutes = opts.minutes ?? previous.minutes;
+  if (!minutes) {
+    if (opts.minutes === undefined) {
+      cfg.quickLeave = { ...previous, banDays };
+      api.saveConfig(cfg);
+      return { content: `Quick-leave bans are **off**. When you turn them on, bans will last ${plural(banDays, 'day')}.` };
+    }
+    if (!previous.minutes) return { content: 'Quick-leave bans are already **off**.' };
+    cfg.quickLeave = { ...previous, minutes: 0, banDays };
+    api.saveConfig(cfg);
+    await api.log(`⚙️ Quick-leave bans turned off by <@${userId}>.`).catch(() => {});
+    return { content: '✅ Quick-leave bans are **off**. Bans already placed still end on their own date.' };
+  }
+
+  cfg.quickLeave = { minutes, banDays };
+  api.saveConfig(cfg);
+  await api
+    .log(
+      `⚙️ Quick-leave bans set by <@${userId}>: leaving within ${plural(minutes, 'minute')} of joining ` +
+        `means a ${banDays}-day ban.`,
+    )
+    .catch(() => {});
+
+  const lines = [
+    `✅ Anyone who leaves within **${plural(minutes, 'minute')}** of joining gets banned for **${plural(banDays, 'day')}**, ` +
+      'then unbanned automatically. This works whether or not inactivity kicks are on.',
+    'Bots and members on the `/autokick` whitelist are never banned. Bans show up in Server Settings → Bans with the ' +
+      'date they end; unban someone there to let them back early.',
+  ];
+  const w = await warning();
+  if (w) lines.push(w);
+  return { content: lines.join('\n') };
+}
+
+// ---------------------------------------------------------------- /slowmode
+
 const SENSITIVITY_LABEL = { low: 'Low', normal: 'Normal', high: 'High' };
 const scaleText = (sensitivity) =>
   slowmodeScale(sensitivity)
@@ -1033,7 +1063,7 @@ const restoreSlowmode = (api, channelId, entry) =>
   api.setSlowmode(channelId, entry.original ?? 0, 'AutoKick: automatic slow mode turned off').catch(() => false);
 
 /**
- * /autokick slowmode: one whitelist. Channels on it get automatic slow mode;
+ * /slowmode: one whitelist. Channels on it get automatic slow mode;
  * messages from roles and users on it don't count toward how busy chat is.
  */
 async function editSlowmode({ api, opts, interaction, userId }, sub) {
@@ -1058,7 +1088,7 @@ async function editSlowmode({ api, opts, interaction, userId }, sub) {
           title: 'Automatic slow mode whitelist',
           color: COLOR,
           fields: [
-            { name: 'Channels (slow mode follows how busy they are)', value: (lines.join('\n') || 'None yet. Add one with `/autokick slowmode add channel:`.').slice(0, 1024) },
+            { name: 'Channels (slow mode follows how busy they are)', value: (lines.join('\n') || 'None yet. Add one with `/slowmode add channel:`.').slice(0, 1024) },
             { name: "Roles and members (their messages don't count)", value: formatList(settings) },
           ],
           footer: { text: `Normal scale: ${scaleText('normal')}. High sensitivity needs half the messages, Low twice as many.` },
@@ -1338,6 +1368,11 @@ async function activity(interaction, api) {
 export async function runCommand(interaction, api) {
   if (interaction.data?.name === 'ping') return ping(interaction, api);
   if (interaction.data?.name === 'activity') return activity(interaction, api);
+  if (interaction.data?.name === 'quickleave') {
+    // No subcommands: the options sit directly on the command.
+    const opts = Object.fromEntries((interaction.data.options ?? []).map((o) => [o.name, o.value]));
+    return quickleave({ api, interaction, userId: interaction.member?.user?.id, opts });
+  }
   const top = interaction.data?.options?.[0];
   if (!top) return { content: 'Unknown command.' };
   const group = top.type === GROUP ? top.name : null;
@@ -1349,9 +1384,9 @@ export async function runCommand(interaction, api) {
     opts: Object.fromEntries((sub?.options ?? []).map((o) => [o.name, o.value])),
   };
   if (interaction.data.name === 'link') return runLinkCommand(ctx, group, sub?.name);
+  if (interaction.data.name === 'slowmode') return editSlowmode(ctx, sub.name);
   if (group === 'pause') return editPauseRoles(ctx, sub.name);
   if (group === 'inactive-roles') return editInactiveRoles(ctx, sub.name);
-  if (group === 'slowmode') return editSlowmode(ctx, sub.name);
   if (Object.hasOwn(CHANNEL_LISTS, group ?? '')) return editChannelList(ctx, group, sub.name);
   if (group) return editList(ctx, group, sub.name);
   const handler = handlers[sub.name];

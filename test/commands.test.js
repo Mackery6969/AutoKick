@@ -73,13 +73,11 @@ function fakeApi({
       detectedPauseRoles: detected,
       botCanAct: botCanKick,
       rolesAboveBot: rolesAbove,
-      botCanBan: perms.ban,
-      botCanViewAuditLog: perms.auditLog,
     }),
     detectedPauseRoles: async () => detected,
     hiddenChannels: async () => hidden,
     botPermissions: async () => perms,
-    tempBanCount: () => tempBans,
+    quickLeaveBanCount: () => tempBans,
     assessMember: async (id) => results.find((r) => r.member.id === id) ?? null,
     log: async (text) => {
       if (logFails) throw new Error('Missing Access');
@@ -470,11 +468,20 @@ test('status, preview and check show warnings', async () => {
   assert.match(enable.content, /1 member\*\* is past the limit\. They get a warning DM first .* kicked 7 days later/);
 });
 
-test('quickleave sets the window and ban length, keeps the length when omitted, turns off at 0', async () => {
+// /quickleave has no subcommands: its options sit directly on the command.
+const quickCmd = (options = []) => ({
+  guild_id: 'G',
+  member: { user: { id: 'admin' } },
+  data: { name: 'quickleave', options },
+});
+const minutes = (value) => ({ name: 'minutes', type: 4, value });
+const banDays = (value) => ({ name: 'ban-days', type: 4, value });
+
+test('/quickleave sets the window and ban length, keeps the length when omitted, turns off at 0', async () => {
   const api = fakeApi();
-  const quick = async (options) => (await runCommand(sub('quickleave', options), api)).content;
-  const minutes = (value) => ({ name: 'minutes', type: 4, value });
-  const banDays = (value) => ({ name: 'ban-days', type: 4, value });
+  const quick = async (options) => (await runCommand(quickCmd(options), api)).content;
+
+  assert.match(await quick(), /Quick-leave bans are \*\*off\*\*\. Turn them on with `\/quickleave minutes:10`/);
 
   const on = await quick([minutes(10), banDays(3)]);
   assert.deepEqual(api.state.cfg.quickLeave, { minutes: 10, banDays: 3 });
@@ -484,27 +491,41 @@ test('quickleave sets the window and ban length, keeps the length when omitted, 
 
   await quick([minutes(5)]);
   assert.deepEqual(api.state.cfg.quickLeave, { minutes: 5, banDays: 3 }, 'ban length kept');
+  await quick([banDays(14)]);
+  assert.deepEqual(api.state.cfg.quickLeave, { minutes: 5, banDays: 14 }, 'window kept when only ban-days is given');
 
   assert.match(await quick([minutes(0)]), /\*\*off\*\*\. Bans already placed still end/);
-  assert.deepEqual(api.state.cfg.quickLeave, { minutes: 0, banDays: 3 });
+  assert.deepEqual(api.state.cfg.quickLeave, { minutes: 0, banDays: 14 });
   assert.match(await quick([minutes(0)]), /already \*\*off\*\*/);
+  assert.match(await quick([banDays(2)]), /^Quick-leave bans are \*\*off\*\*\. When you turn them on, bans will last 2 days\.$/);
+  assert.deepEqual(api.state.cfg.quickLeave, { minutes: 0, banDays: 2 }, 'ban length saved while off');
 });
 
-test('quickleave and status warn about missing Ban Members / View Audit Log', async () => {
+test('/quickleave on its own shows the setting and warns about missing permissions', async () => {
   const on = { ...baseConfig(), quickLeave: { minutes: 10, banDays: 7 } };
-  const reply = async (perms) =>
-    (await runCommand(sub('quickleave', [{ name: 'minutes', type: 4, value: 10 }]), fakeApi({ perms }))).content;
-  assert.match(await reply({ ban: false, auditLog: true }), /don't have the \*\*Ban Members\*\*/);
-  assert.match(await reply({ ban: true, auditLog: false }), /can't see the audit log/);
+  const show = async (opts) => (await runCommand(quickCmd(), fakeApi({ cfg: on, ...opts }))).content;
+  assert.match(await show({ tempBans: 2 }), /\*\*on\*\*: leaving within \*\*10 minutes\*\* of joining means a \*\*7-day\*\* ban\. 2 people are banned right now/);
+  assert.match(await show({ tempBans: 1 }), /1 person is banned right now/);
+  assert.match(await show({ perms: { ban: false } }), /don't have the \*\*Ban Members\*\*/);
+  assert.match(await show({ perms: { auditLog: false } }), /can't see the audit log/);
 
-  const status = await runCommand(sub('status'), fakeApi({ cfg: on, perms: { ban: false, auditLog: false }, tempBans: 2 }));
-  assert.match(status.content, /Ban Members/);
-  const field = status.embeds[0].fields.find((f) => f.name === 'Quick-leave bans');
-  assert.equal(field.value, 'Leave within 10 minutes → 7-day ban (2 banned right now)');
+  const set = async (perms) => (await runCommand(quickCmd([minutes(10)]), fakeApi({ perms }))).content;
+  assert.match(await set({ ban: false }), /don't have the \*\*Ban Members\*\*/);
 
-  const off = await runCommand(sub('status'), fakeApi({ perms: { ban: false, auditLog: false } }));
-  assert.equal(off.content, undefined, 'no ban warnings while the feature is off');
-  assert.equal(off.embeds[0].fields.find((f) => f.name === 'Quick-leave bans').value, 'Off');
+  // /autokick status is only about inactivity now.
+  const status = await runCommand(sub('status'), fakeApi({ cfg: on, perms: { ban: false, auditLog: false } }));
+  assert.equal(status.content, undefined);
+  assert.equal(status.embeds[0].fields.some((f) => /quick-leave/i.test(f.name)), false);
+});
+
+test('bonus features are their own commands, not part of /autokick', () => {
+  const names = COMMANDS.map((c) => c.name);
+  assert.ok(['slowmode', 'quickleave', 'link'].every((n) => names.includes(n)));
+  const autokick = COMMANDS.find((c) => c.name === 'autokick').options.map((o) => o.name);
+  assert.equal(autokick.some((n) => ['slowmode', 'quickleave', 'link'].includes(n)), false);
+  for (const name of ['slowmode', 'quickleave', 'link']) {
+    assert.equal(COMMANDS.find((c) => c.name === name).default_member_permissions, String(1 << 5), `${name}: Manage Server`);
+  }
 });
 
 const actionCmd = (type, banDays) =>
@@ -666,10 +687,15 @@ const linkCmd = (name, options = []) => ({
   data: { name: 'link', options: [{ type: 1, name, options }] },
 });
 const opt = (name, value, type = 3) => ({ name, type, value });
+const slowCmd = (name, options = [], resolved) => ({
+  guild_id: 'G',
+  member: { user: { id: 'admin' } },
+  data: { name: 'slowmode', options: [{ type: 1, name, options }], resolved },
+});
 
 test('slowmode: add remembers the old value, list shows activity, remove puts it back', async () => {
   const api = fakeApi();
-  const slow = (name, options) => runCommand(groupCmd('autokick', 'slowmode', name, options), api);
+  const slow = (name, options) => runCommand(slowCmd(name, options), api);
 
   const added = (await slow('add', [opt('channel', 'C1', 7), opt('max-seconds', 60, 4)])).content;
   assert.deepEqual(api.state.cfg.slowmode.channels.C1, { min: 0, max: 60, sensitivity: 'normal', calm: 3, original: 4 });
@@ -702,7 +728,7 @@ test('slowmode: add remembers the old value, list shows activity, remove puts it
 
 test("slowmode whitelist: roles and users don't count; settings only for channels; reset restores channels", async () => {
   const api = fakeApi();
-  const slow = (name, options = [], resolved) => runCommand(groupCmd('autokick', 'slowmode', name, options, resolved), api);
+  const slow = (name, options = [], resolved) => runCommand(slowCmd(name, options, resolved), api);
   const id = '123456789012345678';
 
   const role = (await slow('add', [opt('target', 'STAFF', 9)], { roles: { STAFF: { id: 'STAFF' } } })).content;
@@ -732,7 +758,7 @@ test("slowmode whitelist: roles and users don't count; settings only for channel
 
 test('slowmode warns without Manage Channels', async () => {
   const api = fakeApi({ perms: { manageChannels: false } });
-  const reply = await runCommand(groupCmd('autokick', 'slowmode', 'add', [opt('channel', 'C1', 7)]), api);
+  const reply = await runCommand(slowCmd('add', [opt('channel', 'C1', 7)]), api);
   assert.match(reply.content, /Manage Channels/);
 });
 
