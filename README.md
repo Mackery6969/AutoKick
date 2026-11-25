@@ -33,7 +33,7 @@ Members get a DM explaining what happened (if their DMs are open), and everythin
 
 - Bots and the server owner.
 - Anyone whose highest role is above the bot's role (Discord won't allow it). This doesn't apply to the role action, which only needs the bot's role above the roles it gives or takes.
-- Whitelisted members and roles (see [Whitelist and blacklist](#whitelist-and-blacklist)).
+- Blacklisted members and roles (see [Blacklist and whitelist](#blacklist-and-whitelist)).
 
 ## Safety features
 
@@ -59,7 +59,7 @@ These are extras, separate from inactivity kicks. **Every one is off until you s
 `/quickleave minutes:10 ban-days:7` bans anyone who leaves within 10 minutes of joining for 7 days, then unbans them automatically. `minutes:0` turns it off, and `/quickleave` on its own shows the current setting and how many people are banned right now.
 
 - It stops the same people from bouncing in and out again. It can't stop someone's first join and leave, because they're already gone by then.
-- Never banned: bots and members on the `/autokick` whitelist. Someone who rejoins before the ban goes out (within about a minute) isn't banned.
+- Never banned: bots and members on the `/autokick` blacklist. Someone who rejoins before the ban goes out (within about a minute) isn't banned.
 - People kicked by a moderator or another bot (a verification bot, say) aren't banned, as long as the bot has **View Audit Log** so it can tell a kick from a leave.
 - The bot needs **Ban Members**. `/quickleave` warns if either permission is missing.
 - Bans show up in Server Settings → Bans with the date they end. Unban someone there to let them back early. If a moderator replaces the ban with their own, the bot leaves it in place.
@@ -135,8 +135,8 @@ The bot needs **Ban Members**, **Moderate Members** and/or **Manage Roles** in t
 | `/autokick inactive-roles give/take/unset/list/reset` | Roles given to or taken from inactive members (for the give/take roles action) |
 | `/autokick warn days:` | DM members this many days before they're kicked (0 = off, the default) |
 | `/autokick logchannel [channel:]` | Post kicks, warnings, bans and setting changes in a channel, for every feature (leave empty to turn off) |
-| `/autokick whitelist add/remove/list/reset` | Roles or members that are never kicked. `add`/`remove` take a role or member, or a `user-id` for someone not in the server |
-| `/autokick blacklist add/remove/list/reset` | Roles or members that can be kicked even if they have a whitelisted role (same options as the whitelist) |
+| `/autokick blacklist add/remove/list/reset` | Roles or members that are never kicked. `add`/`remove` take a role or member, or a `user-id` for someone not in the server |
+| `/autokick whitelist add/remove/list/reset` | Roles or members that can be kicked even if they have a blacklisted role (same options as the blacklist) |
 | `/autokick channel-whitelist add/remove/list/reset` | If set, only activity in these channels/categories counts |
 | `/autokick channel-blacklist add/remove/list/reset` | Activity in these channels/categories doesn't count |
 | `/autokick pause add/remove/list` | Roles that pause a member's clock while they have them (timeouts always do) |
@@ -160,19 +160,21 @@ The bot needs **Ban Members**, **Moderate Members** and/or **Manage Roles** in t
 | `/activity [member:]` | When you (or another member) last sent a message or was in voice (anyone can use it) |
 | `/ping` | Check the bot is online and replying (anyone can use it) |
 
-### Whitelist and blacklist
+### Blacklist and whitelist
 
-Everyone is checked for inactivity unless the whitelist protects them. When rules conflict, the more specific one wins:
+Everyone is checked for inactivity unless the blacklist leaves them out. The whitelist overrides blacklisted roles. When rules conflict, the more specific one wins:
 
-1. Member on the **whitelist** → never kicked.
-2. Member on the **blacklist** → can be kicked.
-3. Has a **blacklisted role** → can be kicked, even if they also have a whitelisted role.
-4. Has a **whitelisted role** → never kicked.
+1. Member on the **blacklist** → never kicked.
+2. Member on the **whitelist** → can be kicked.
+3. Has a **whitelisted role** → can be kicked, even if they also have a blacklisted role.
+4. Has a **blacklisted role** → never kicked.
 5. Otherwise → kicked once inactive past the limit.
 
-Example: whitelist `@Members`, blacklist `@Trial`. Inactive members with `@Members` are safe, unless they also have `@Trial`.
+Example: blacklist `@Members`, whitelist `@Addons`. Inactive members with `@Members` are safe, unless they also have `@Addons`.
 
-`reset` clears a whole list. Clearing the whitelist while AutoKick is on restarts the one-hour grace period, so people who were protected aren't kicked straight away.
+`reset` clears a whole list. Clearing the blacklist while AutoKick is on restarts the one-hour grace period, so people who were protected aren't kicked straight away.
+
+Before this version the two lists meant the opposite (whitelist = never kicked). Existing lists were swapped over automatically on update, so everyone kept the same protection.
 
 ### Channel whitelist and blacklist
 
@@ -258,6 +260,6 @@ Tests need Node 22.13 or newer: the linked-server tests use Node's built-in SQLi
 | `src/linking.js` | Linked servers: link codes, and copying bans, timeouts and roles between servers |
 | `src/slowmode.js` | Automatic slow mode: counting messages and adjusting channels |
 | `src/targets.js` | Reading "role, member or user ID" command options |
-| `src/policy.js` | The rules (whitelist/blacklist, inactivity, downtime, slow mode scale, link settings) |
+| `src/policy.js` | The rules (blacklist/whitelist, inactivity, downtime, slow mode scale, link settings) |
 | `src/discord.js` | Discord API calls and the "can the bot kick this member" check |
 | `src/verify.js` | Checks Discord's signature on incoming slash commands |

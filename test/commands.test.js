@@ -164,10 +164,17 @@ test('whitelist add moves an entry off the blacklist; @everyone is refused', asy
   assert.deepEqual(api.state.cfg.whitelist.roles, ['R1']);
   assert.deepEqual(api.state.cfg.blacklist.roles, []);
   assert.match(reply.content, /removed it from the blacklist/);
+  assert.match(reply.content, /can be auto-kicked for inactivity even if they also have a blacklisted role/);
+  const status = Object.fromEntries((await runCommand(sub('status'), api)).embeds[0].fields.map((f) => [f.name, f.value]));
+  assert.equal(status['Whitelist (kickable even with a blacklisted role)'], '<@&R1>');
+  assert.equal(status['Blacklist (never kicked)'], 'None');
+
+  const protect = await runCommand(listCmd('blacklist', 'add', 'R2', { roles: { R2: { id: 'R2' } } }), api);
+  assert.match(protect.content, /Members with <@&R2> will never be auto-kicked \(unless they're whitelisted or have a whitelisted role\)/);
 
   const everyone = await runCommand(listCmd('blacklist', 'add', 'G', { roles: { G: { id: 'G' } } }), api);
   assert.match(everyone.content, /@everyone can't/);
-  assert.deepEqual(api.state.cfg.blacklist.roles, []);
+  assert.deepEqual(api.state.cfg.blacklist.roles, ['R2']);
 });
 
 test('blacklist add/remove for a member', async () => {
@@ -220,7 +227,7 @@ test('leaderboard ranks watched members by time left, closest first', async () =
         remainingMs: 1 * DAY_MS,
         warning: { at: now - 6 * DAY_MS, kickAfter: now + DAY_MS, delivered: true },
       }),
-      result('staff', 'protected', { reason: 'whitelisted role', roleId: 'S' }),
+      result('staff', 'protected', { reason: 'blacklisted role', roleId: 'S' }),
       result('robot', 'skip', { reason: 'bot' }),
     ],
   });
@@ -234,7 +241,7 @@ test('leaderboard ranks watched members by time left, closest first', async () =
   assert.match(embed.description, /<@close>.*▰{9}▱ 90% .*🟡 kicked <t:\d+:R>/);
   assert.match(embed.description, /<@muted>.*⏸️ clock paused \(timed out\), 10 days left/);
   assert.match(embed.description, /<@fresh>.*▱{10} 6% .*🟢 kicked/);
-  assert.match(embed.footer.text, /Not ranked: 1 protected by the whitelist, bots and the server owner\./);
+  assert.match(embed.footer.text, /Not ranked: 1 protected by the blacklist, bots and the server owner\./);
 
   const top = (await runCommand(sub('leaderboard', [{ name: 'count', type: 4, value: 2 }]), api)).embeds[0];
   assert.equal(top.title, 'Inactivity leaderboard (top 2 of 6)');
@@ -245,7 +252,7 @@ test('leaderboard ranks watched members by time left, closest first', async () =
   assert.match(off.embeds[0].description, /🔴 past the limit$/);
 
   const empty = await runCommand(sub('leaderboard'), fakeApi({ results: [result('staff', 'protected')] }));
-  assert.match(empty.content, /Nobody is being watched.*1 protected by the whitelist/);
+  assert.match(empty.content, /Nobody is being watched.*1 protected by the blacklist/);
 });
 
 const pauseCmd = (name, role) => ({
@@ -306,14 +313,14 @@ test("status warns when the bot can't kick most members", async () => {
   const member = (id, action, kickable, reason) => result(id, action, { kickable, reason });
   const statusText = async (opts) => (await runCommand(sub('status'), fakeApi(opts))).content ?? '';
 
-  // 3 of 4 candidates can't be kicked; bots/owner/whitelisted don't count either way.
+  // 3 of 4 candidates can't be kicked; bots/owner/blacklisted don't count either way.
   const mostlyBlocked = [
     member('a', 'keep', false),
     member('b', 'keep', false),
     member('c', 'blocked', false),
     member('d', 'keep', true),
     member('bot', 'skip', false, 'bot'),
-    member('staff', 'protected', false, 'whitelisted role'),
+    member('staff', 'protected', false, 'blacklisted role'),
   ];
   assert.match(await statusText({ results: mostlyBlocked }), /can't kick most members \(3 of 4\)/);
   assert.match(await statusText({ results: mostlyBlocked, botCanKick: false }), /don't have the \*\*Kick Members\*\* permission/);
@@ -328,27 +335,27 @@ test("status warns when the bot can't kick most members", async () => {
   assert.doesNotMatch(enable.content, /inactive member can't be kicked/);
 });
 
-test('check always shows blacklist status and whether the bot can kick them', async () => {
+test('check always shows whitelist status and whether the bot can kick them', async () => {
   const api = fakeApi({
     results: [
-      result('a', 'keep', { kickable: true, remainingMs: DAY_MS, listed: { reason: 'blacklisted role', roleId: 'TRIAL' } }),
+      result('a', 'keep', { kickable: true, remainingMs: DAY_MS, listed: { reason: 'whitelisted role', roleId: 'TRIAL' } }),
       result('b', 'keep', { kickable: false, remainingMs: DAY_MS, listed: null }),
-      result('c', 'blocked', { kickable: false, listed: { reason: 'blacklisted member', roleId: null } }),
+      result('c', 'blocked', { kickable: false, listed: { reason: 'whitelisted member', roleId: null } }),
       result('o', 'skip', { kickable: false, reason: 'server owner', listed: null }),
     ],
   });
   const check = async (id) => (await runCommand(sub('check', [{ name: 'member', type: 6, value: id }]), api)).content;
 
   const a = await check('a');
-  assert.match(a, /Blacklisted through the role <@&TRIAL>/);
+  assert.match(a, /Whitelisted through the role <@&TRIAL>, so blacklisted roles don't protect them/);
   assert.match(a, /I can kick them/);
 
   const b = await check('b');
-  assert.doesNotMatch(b, /Blacklisted/);
+  assert.doesNotMatch(b, /Whitelisted/);
   assert.match(b, /I can't kick them: they have a role above mine/);
 
   const c = await check('c');
-  assert.match(c, /Blacklisted \(as a member\)/);
+  assert.match(c, /Whitelisted \(as a member\)/);
   assert.equal(c.match(/can't kick them/g).length, 1, 'not repeated for past-the-limit members');
 
   assert.doesNotMatch(await check('o'), /I can|I can't kick/, 'owner line already says it');
@@ -368,7 +375,7 @@ test('/activity shows last activity for you or another member', async () => {
   const api = fakeApi({
     results: [
       result('me', 'keep', { recorded: true, lastActive: seen }),
-      result('other', 'protected', { recorded: true, lastActive: seen, reason: 'whitelisted member' }),
+      result('other', 'protected', { recorded: true, lastActive: seen, reason: 'blacklisted member' }),
       result('quiet', 'keep', { recorded: false, lastActive: baseConfig().trackingSince }),
     ],
   });
@@ -382,7 +389,7 @@ test('/activity shows last activity for you or another member', async () => {
   assert.equal((await runCommand(cmd(), api)).content, `You were last active <t:${unix}:R> (<t:${unix}:f>).`);
   const other = (await runCommand(cmd('other'), api)).content;
   assert.match(other, /\*\*user\\_other\*\* was last active/);
-  assert.doesNotMatch(other, /whitelist|protected/i, 'no moderation details for members');
+  assert.doesNotMatch(other, /blacklist|whitelist|protected/i, 'no moderation details for members');
   assert.match((await runCommand(cmd('quiet'), api)).content, /hasn't sent a message or been in voice since I started tracking/);
   assert.match((await runCommand(cmd('ghost'), api)).content, /isn't in this server/);
 });
@@ -424,25 +431,25 @@ test('channel blacklist and whitelist: add, move, remove, list, reset', async ()
   assert.match((await runCommand(channelCmd('channel-blacklist', 'reset'), api)).content, /already empty/);
 });
 
-test('whitelist reset clears it and re-arms the grace period while on', async () => {
+test('blacklist reset clears it and re-arms the grace period while on', async () => {
   const cfg = { ...baseConfig(), enabled: true, armedAt: Date.now() - DAY_MS };
-  cfg.whitelist = { roles: ['STAFF'], users: ['U1'] };
-  const api = fakeApi({ cfg });
-  const reply = await runCommand(listCmd('whitelist', 'reset'), api);
-  assert.deepEqual(api.state.cfg.whitelist, { roles: [], users: [] });
-  assert.ok(api.state.cfg.armedAt > Date.now() + 59 * 60_000);
-  assert.match(reply.content, /Cleared the whitelist \(2 entries: <@&STAFF>, <@U1>\)/);
-  assert.match(reply.content, /can't be kicked before/);
-});
-
-test('blacklist reset clears it without touching the grace period', async () => {
-  const cfg = { ...baseConfig(), enabled: true, armedAt: null };
-  cfg.blacklist = { roles: [], users: ['U1'] };
+  cfg.blacklist = { roles: ['STAFF'], users: ['U1'] };
   const api = fakeApi({ cfg });
   const reply = await runCommand(listCmd('blacklist', 'reset'), api);
   assert.deepEqual(api.state.cfg.blacklist, { roles: [], users: [] });
+  assert.ok(api.state.cfg.armedAt > Date.now() + 59 * 60_000);
+  assert.match(reply.content, /Cleared the blacklist \(2 entries: <@&STAFF>, <@U1>\)/);
+  assert.match(reply.content, /can't be kicked before/);
+});
+
+test('whitelist reset clears it without touching the grace period', async () => {
+  const cfg = { ...baseConfig(), enabled: true, armedAt: null };
+  cfg.whitelist = { roles: [], users: ['U1'] };
+  const api = fakeApi({ cfg });
+  const reply = await runCommand(listCmd('whitelist', 'reset'), api);
+  assert.deepEqual(api.state.cfg.whitelist, { roles: [], users: [] });
   assert.equal(api.state.cfg.armedAt, null);
-  assert.match(reply.content, /Cleared the blacklist \(1 entry: <@U1>\)\.$/);
+  assert.match(reply.content, /Cleared the whitelist \(1 entry: <@U1>\)\.$/);
 });
 
 test('warn sets, refuses and turns off the warning DM', async () => {
@@ -917,9 +924,9 @@ test('link exempt takes roles, members and user IDs', async () => {
 });
 
 test('check explains protection', async () => {
-  const api = fakeApi({ results: [result('a', 'protected', { reason: 'whitelisted role', roleId: 'R9' })] });
+  const api = fakeApi({ results: [result('a', 'protected', { reason: 'blacklisted role', roleId: 'R9' })] });
   const reply = await runCommand(sub('check', [{ name: 'member', type: 6, value: 'a' }]), api);
-  assert.match(reply.content, /Protected by the whitelisted role <@&R9>/);
+  assert.match(reply.content, /Protected by the blacklisted role <@&R9>/);
   const missing = await runCommand(sub('check', [{ name: 'member', type: 6, value: 'zzz' }]), api);
   assert.match(missing.content, /isn't in this server/);
 });

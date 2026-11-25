@@ -3,31 +3,41 @@
 export const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Decide whether the whitelist/blacklist protects a member.
+ * Decide whether the member lists protect a member. The blacklist is left out
+ * of inactivity kicks; the whitelist can be kicked even with a blacklisted role.
  *
  * The most specific rule wins:
- *   1. Member is whitelisted         -> protected
- *   2. Member is blacklisted         -> not protected
- *   3. Member has a blacklisted role -> not protected (beats whitelisted roles)
- *   4. Member has a whitelisted role -> protected
+ *   1. Member is blacklisted         -> protected
+ *   2. Member is whitelisted         -> not protected
+ *   3. Member has a whitelisted role -> not protected (beats blacklisted roles)
+ *   4. Member has a blacklisted role -> protected
  *   5. Otherwise                     -> not protected (normal inactivity rules apply)
  */
 export function listVerdict(cfg, userId, roleIds) {
-  if (cfg.whitelist.users.includes(userId)) {
-    return { protected: true, reason: 'whitelisted member' };
-  }
   if (cfg.blacklist.users.includes(userId)) {
-    return { protected: false, reason: 'blacklisted member' };
+    return { protected: true, reason: 'blacklisted member' };
   }
-  const blacklistedRole = cfg.blacklist.roles.find((id) => roleIds.includes(id));
-  if (blacklistedRole) {
-    return { protected: false, reason: 'blacklisted role', roleId: blacklistedRole };
+  if (cfg.whitelist.users.includes(userId)) {
+    return { protected: false, reason: 'whitelisted member' };
   }
   const whitelistedRole = cfg.whitelist.roles.find((id) => roleIds.includes(id));
   if (whitelistedRole) {
-    return { protected: true, reason: 'whitelisted role', roleId: whitelistedRole };
+    return { protected: false, reason: 'whitelisted role', roleId: whitelistedRole };
+  }
+  const blacklistedRole = cfg.blacklist.roles.find((id) => roleIds.includes(id));
+  if (blacklistedRole) {
+    return { protected: true, reason: 'blacklisted role', roleId: blacklistedRole };
   }
   return { protected: false, reason: null };
+}
+
+/**
+ * A stored config from before the member lists swapped meaning (whitelist used to
+ * be "never kicked"), with its lists swapped so every entry keeps doing what it did.
+ */
+export function swapMemberLists(cfg) {
+  const empty = () => ({ roles: [], users: [] });
+  return { ...cfg, whitelist: cfg.blacklist ?? empty(), blacklist: cfg.whitelist ?? empty() };
 }
 
 /**
@@ -127,7 +137,7 @@ export function warningMs(cfg) {
  *   'keep'      - still within the limit (reason 'active'), or past it but still
  *                 inside the notice their warning DM gave them (reason 'notice')
  *   'paused'    - muted right now, so their clock is stopped and they can't be kicked
- *   'protected' - covered by the whitelist
+ *   'protected' - covered by the blacklist (left out of inactivity kicks)
  *   'skip'      - bots and the server owner are never kicked
  * `warnNow` is true when a warning DM should be sent now.
  */
@@ -214,13 +224,13 @@ export function pauseChanges(rows, member, pauseRoles, now) {
 
 /**
  * How long to ban someone who just left, or 0 for no ban. Leaving within
- * `quickLeave.minutes` of joining counts (0 = feature off). Whitelisted
+ * `quickLeave.minutes` of joining counts (0 = feature off). Blacklisted
  * members are never banned.
  */
 export function quickLeaveBanMs(cfg, { userId, joinedAt, leftAt }) {
   const { minutes = 0, banDays = 7 } = cfg?.quickLeave ?? {};
   if (!minutes || joinedAt == null) return 0;
-  if (cfg.whitelist?.users?.includes(userId)) return 0;
+  if (cfg.blacklist?.users?.includes(userId)) return 0;
   if (leftAt - joinedAt > minutes * 60_000) return 0;
   return banDays * DAY_MS;
 }

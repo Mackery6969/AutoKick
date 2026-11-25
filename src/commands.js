@@ -176,8 +176,8 @@ export const COMMANDS = [
           { type: CHANNEL, name: 'channel', description: 'Text channel for kick logs', channel_types: [0, 5] },
         ],
       },
-      listGroup('whitelist', 'Roles and members that are never auto-kicked'),
-      listGroup('blacklist', 'Roles and members that can be kicked even with a whitelisted role'),
+      listGroup('blacklist', 'Roles and members that are never auto-kicked'),
+      listGroup('whitelist', 'Roles and members that can be kicked even with a blacklisted role'),
       channelListGroup('channel-whitelist', 'If set, only activity in these channels/categories counts'),
       channelListGroup('channel-blacklist', "Activity in these channels/categories doesn't count"),
       {
@@ -349,6 +349,12 @@ const CHANNEL_RULES =
   'A category covers every channel in it, and threads follow their channel. The most specific entry wins, ' +
   'so you can blacklist a category but whitelist one channel inside it.';
 
+/** Member lists: the blacklist is left out of inactivity kicks, the whitelist beats blacklisted roles. */
+const LIST_TITLES = {
+  blacklist: 'Blacklist (never kicked)',
+  whitelist: 'Whitelist (kickable even with a blacklisted role)',
+};
+
 const MAX_ACTION_ROLES = 5;
 const roleMentions = (ids) => ids.map((id) => `<@&${id}>`).join(', ');
 
@@ -418,7 +424,7 @@ const NOT_CONNECTED =
 
 /**
  * Warning when the bot can't carry out the action on most of the members it
- * might need to (not bots, the owner or whitelisted members): usually a missing
+ * might need to (not bots, the owner or blacklisted members): usually a missing
  * permission or the bot's role sitting too low. Returns null when it's fine.
  * `assessed` is what api.assessGuild() returned (botCanAct, rolesAboveBot).
  */
@@ -474,7 +480,7 @@ function fitLines(parts, max = 3900) {
 
 // ---------------------------------------------------------------- leaderboard
 
-/** Everyone the inactivity rules still apply to (not bots, the owner, whitelisted or already marked). */
+/** Everyone the inactivity rules still apply to (not bots, the owner, blacklisted or already marked). */
 const RANKED_ACTIONS = new Set(['kick', 'blocked', 'keep', 'paused']);
 const SOON_MS = 7 * DAY_MS;
 
@@ -622,8 +628,8 @@ const handlers = {
         ...(w.action.type === 'role' || marked
           ? [{ name: 'Marked inactive (roles changed)', value: String(marked), inline: true }]
           : []),
-        { name: 'Whitelist (never kicked)', value: formatList(cfg.whitelist) },
-        { name: 'Blacklist (kickable even with a whitelisted role)', value: formatList(cfg.blacklist) },
+        { name: LIST_TITLES.blacklist, value: formatList(cfg.blacklist) },
+        { name: LIST_TITLES.whitelist, value: formatList(cfg.whitelist) },
         { name: 'Pause roles (plus anyone timed out)', value: formatPauseRoles(cfg, detectedPauseRoles) },
         { name: 'Channels where activity counts', value: formatChannelRules(cfg) },
         { name: "Channels I can't see", value: formatHidden(hidden) },
@@ -700,7 +706,7 @@ const handlers = {
     const protectedCount = results.filter((r) => r.result.action === 'protected').length;
     const marked = results.filter((r) => r.result.action === 'done').length;
     const notes = [];
-    if (protectedCount) notes.push(`${protectedCount} protected by the whitelist`);
+    if (protectedCount) notes.push(`${protectedCount} protected by the blacklist`);
     if (marked) notes.push(`${marked} already marked inactive`);
     notes.push('bots and the server owner');
     const notRanked = `Not ranked: ${notes.join(', ')}.`;
@@ -784,20 +790,20 @@ const handlers = {
       }
       case 'protected':
         lines.push(
-          result.reason === 'whitelisted role'
-            ? `🛡️ Protected by the whitelisted role <@&${result.roleId}>.`
-            : '🛡️ Protected: they are on the whitelist.',
+          result.reason === 'blacklisted role'
+            ? `🛡️ Protected by the blacklisted role <@&${result.roleId}>.`
+            : '🛡️ Protected: they are on the blacklist.',
         );
         break;
       default:
         lines.push(result.reason === 'bot' ? '🤖 Bots are never kicked.' : '👑 The server owner is never kicked.');
     }
 
-    // Admin-only details: blacklist and whether the bot could act on them at all.
-    if (result.listed?.reason === 'blacklisted member') {
-      lines.push("📛 Blacklisted (as a member), so whitelisted roles don't protect them.");
-    } else if (result.listed?.reason === 'blacklisted role') {
-      lines.push(`📛 Blacklisted through the role <@&${result.listed.roleId}>, so whitelisted roles don't protect them.`);
+    // Admin-only details: whitelist and whether the bot could act on them at all.
+    if (result.listed?.reason === 'whitelisted member') {
+      lines.push("📛 Whitelisted (as a member), so blacklisted roles don't protect them.");
+    } else if (result.listed?.reason === 'whitelisted role') {
+      lines.push(`📛 Whitelisted through the role <@&${result.listed.roleId}>, so blacklisted roles don't protect them.`);
     }
     if (result.action !== 'skip' && result.action !== 'blocked') {
       lines.push(result.kickable ? `👢 I can ${w.can}.` : `🚫 I can't ${w.can}: ${blockedHelp(cfg)}`);
@@ -961,15 +967,15 @@ const handlers = {
 };
 
 const LIST_EXPLAINERS = {
-  whitelist: {
-    roles: (m) => `Members with ${m} will never be auto-kicked (unless they're blacklisted or have a blacklisted role).`,
+  blacklist: {
+    roles: (m) => `Members with ${m} will never be auto-kicked (unless they're whitelisted or have a whitelisted role).`,
     users: (m) => `${m} will never be auto-kicked.`,
   },
-  blacklist: {
+  whitelist: {
     roles: (m) =>
-      `Members with ${m} can be auto-kicked for inactivity even if they also have a whitelisted role ` +
-      '(individually whitelisted members stay protected).',
-    users: (m) => `${m} can be auto-kicked for inactivity even if they have a whitelisted role.`,
+      `Members with ${m} can be auto-kicked for inactivity even if they also have a blacklisted role ` +
+      '(individually blacklisted members stay protected).',
+    users: (m) => `${m} can be auto-kicked for inactivity even if they have a blacklisted role.`,
   },
 };
 
@@ -977,8 +983,7 @@ async function editList({ api, opts, interaction, userId }, listName, action) {
   if (listName !== 'whitelist' && listName !== 'blacklist') return { content: 'Unknown command.' };
   const cfg = api.getConfig();
   if (action === 'list') {
-    const title = listName === 'whitelist' ? 'Whitelist (never kicked)' : 'Blacklist (kickable even with a whitelisted role)';
-    return { embeds: [{ title, color: COLOR, description: formatList(cfg[listName]) }] };
+    return { embeds: [{ title: LIST_TITLES[listName], color: COLOR, description: formatList(cfg[listName]) }] };
   }
 
   if (action === 'reset') {
@@ -987,7 +992,7 @@ async function editList({ api, opts, interaction, userId }, listName, action) {
     const cleared = formatList(cfg[listName]);
     cfg[listName] = { roles: [], users: [] };
     let grace = '';
-    if (listName === 'whitelist' && cfg.enabled) {
+    if (listName === 'blacklist' && cfg.enabled) {
       // People who were protected may now be past the limit: same one-hour window as enabling.
       cfg.armedAt = Math.max(cfg.armedAt ?? 0, Date.now() + api.enableGraceMs);
       grace = ` Anyone who was protected can't be kicked before ${ts(cfg.armedAt)}.`;
@@ -1135,7 +1140,7 @@ async function quickleave({ api, opts, userId }) {
   const lines = [
     `✅ Anyone who leaves within **${plural(minutes, 'minute')}** of joining gets banned for **${plural(banDays, 'day')}**, ` +
       'then unbanned automatically. This works whether or not inactivity kicks are on.',
-    'Bots and members on the `/autokick` whitelist are never banned. Bans show up in Server Settings → Bans with the ' +
+    'Bots and members on the `/autokick` blacklist are never banned. Bans show up in Server Settings → Bans with the ' +
       'date they end; unban someone there to let them back early.',
   ];
   const w = await warning();

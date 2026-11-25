@@ -22,6 +22,7 @@ import {
   formatShortDuration,
   pauseChanges,
   quickLeaveBanMs,
+  swapMemberLists,
 } from './policy.js';
 import {
   APP_FLAGS_MEMBERS_INTENT,
@@ -116,8 +117,8 @@ function defaultConfig(now) {
     logChannelId: null,
     trackingSince: now,
     armedAt: null,
-    whitelist: { roles: [], users: [] },
-    blacklist: { roles: [], users: [] },
+    blacklist: { roles: [], users: [] }, // never kicked
+    whitelist: { roles: [], users: [] }, // kickable even with a blacklisted role
     pauseRoles: [], // members with these roles don't lose time (plus auto-detected "Muted" roles)
     channels: { whitelist: [], blacklist: [] }, // where activity counts (channels, categories, threads)
     warnDays: 0, // DM members this many days before a kick (0 = off)
@@ -177,6 +178,7 @@ export class AutoKickBot extends DurableObject {
       guild_id TEXT NOT NULL, user_id TEXT NOT NULL, applied_at INTEGER NOT NULL,
       added TEXT NOT NULL, removed TEXT NOT NULL, complete INTEGER NOT NULL,
       PRIMARY KEY (guild_id, user_id))`);
+    this.migrateMemberLists();
     this.initLinks();
     this.initSlowmode();
 
@@ -215,6 +217,21 @@ export class AutoKickBot extends DurableObject {
         JSON.stringify(value),
       );
     }
+  }
+
+  /**
+   * The member whitelist and blacklist used to mean the opposite (whitelist = never
+   * kicked). Swap every server's stored lists once, so nobody's protection changes.
+   */
+  migrateMemberLists() {
+    if (this.getState('memberListsSwapped')) return;
+    this.ctx.storage.transactionSync(() => {
+      for (const row of this.sql.exec('SELECT id, config FROM guilds').toArray()) {
+        const cfg = swapMemberLists(JSON.parse(row.config));
+        this.sql.exec('UPDATE guilds SET config = ? WHERE id = ?', JSON.stringify(cfg), row.id);
+      }
+      this.setState('memberListsSwapped', true);
+    });
   }
 
   getConfig(guildId) {
@@ -1404,7 +1421,7 @@ export class AutoKickBot extends DurableObject {
     const done = () => this.sql.exec('DELETE FROM quick_leaves WHERE guild_id = ? AND user_id = ?', guildId, userId);
     const cfg = this.getConfig(guildId);
     const banMs = quickLeaveBanMs(cfg, { userId, joinedAt: row.joined_at, leftAt: row.left_at });
-    if (!banMs) return done(); // turned off, or whitelisted, since they left
+    if (!banMs) return done(); // turned off, or blacklisted, since they left
 
     const stayed = formatShortDuration(row.left_at - row.joined_at);
     const who = `<@${userId}> (**${escapeMarkdown(row.username ?? userId)}**)`;

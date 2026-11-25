@@ -23,6 +23,7 @@ import {
   slowmodeScale,
   slowmodeSettings,
   listVerdict,
+  swapMemberLists,
   channelCounts,
   countsAsVoice,
   mergeIntervals,
@@ -41,15 +42,32 @@ const cfg = (overrides = {}) => ({
 });
 
 test('listVerdict: most specific rule wins', () => {
+  // Blacklist = never kicked; whitelist = kickable even with a blacklisted role.
   const c = cfg({
-    whitelist: { roles: ['staff'], users: ['vip'] },
-    blacklist: { roles: ['trial'], users: ['troll'] },
+    blacklist: { roles: ['staff'], users: ['vip'] },
+    whitelist: { roles: ['addons'], users: ['troll'] },
   });
-  assert.equal(listVerdict(c, 'vip', ['trial']).protected, true, 'whitelisted member beats blacklisted role');
-  assert.equal(listVerdict(c, 'troll', ['staff']).protected, false, 'blacklisted member beats whitelisted role');
-  assert.equal(listVerdict(c, 'x', ['staff', 'trial']).protected, false, 'blacklisted role beats whitelisted role');
-  assert.equal(listVerdict(c, 'x', ['staff']).protected, true, 'whitelisted role protects');
+  assert.equal(listVerdict(c, 'vip', ['addons']).protected, true, 'blacklisted member beats whitelisted role');
+  assert.equal(listVerdict(c, 'troll', ['staff']).protected, false, 'whitelisted member beats blacklisted role');
+  assert.deepEqual(
+    listVerdict(c, 'x', ['staff', 'addons']),
+    { protected: false, reason: 'whitelisted role', roleId: 'addons' },
+    'whitelisted role beats blacklisted role',
+  );
+  assert.deepEqual(listVerdict(c, 'x', ['staff']), { protected: true, reason: 'blacklisted role', roleId: 'staff' });
+  assert.equal(listVerdict(c, 'x', ['addons']).protected, false, 'whitelisted role alone: kickable');
   assert.equal(listVerdict(c, 'x', []).protected, false, 'no lists: not protected');
+});
+
+test('swapMemberLists moves old entries so they keep doing the same thing', () => {
+  const old = { days: 30, whitelist: { roles: ['staff'], users: ['vip'] }, blacklist: { roles: ['trial'], users: [] } };
+  const swapped = swapMemberLists(old);
+  assert.deepEqual(swapped.blacklist, { roles: ['staff'], users: ['vip'] }, 'old whitelist (never kicked) is the new blacklist');
+  assert.deepEqual(swapped.whitelist, { roles: ['trial'], users: [] });
+  assert.equal(swapped.days, 30, 'other settings kept');
+  assert.equal(listVerdict(swapped, 'x', ['staff', 'trial']).protected, false, 'same verdict as before the swap');
+  assert.equal(listVerdict(swapped, 'vip', ['trial']).protected, true);
+  assert.deepEqual(swapMemberLists({}), { whitelist: { roles: [], users: [] }, blacklist: { roles: [], users: [] } });
 });
 
 test('lastActiveAt never goes earlier than tracking start or join date', () => {
@@ -81,7 +99,7 @@ test('observedInactiveMs subtracts bot downtime', () => {
 test('assess covers every outcome', () => {
   const now = 100 * DAY_MS;
   const ctx = { now, downtime: [] };
-  const c = cfg({ whitelist: { roles: ['staff'], users: [] }, activity: { recent: now - DAY_MS } });
+  const c = cfg({ blacklist: { roles: ['staff'], users: [] }, activity: { recent: now - DAY_MS } });
   const member = (o) => ({ id: 'm', bot: false, isOwner: false, kickable: true, roleIds: [], joinedTimestamp: 0, ...o });
 
   assert.equal(assess(member({ bot: true }), c, ctx).action, 'skip');
@@ -136,10 +154,10 @@ test('a member who is muted right now is never kicked and their clock is frozen'
 });
 
 test('assess reports which list entry applies and whether the member is kickable', () => {
-  const c = cfg({ blacklist: { roles: ['trial'], users: [] }, activity: { m: DAY_MS } });
+  const c = cfg({ whitelist: { roles: ['trial'], users: [] }, activity: { m: DAY_MS } });
   const result = assess(plain({ roleIds: ['trial'], kickable: false }), c, { now: 2 * DAY_MS, downtime: [] });
   assert.equal(result.action, 'keep');
-  assert.deepEqual(result.listed, { reason: 'blacklisted role', roleId: 'trial' });
+  assert.deepEqual(result.listed, { reason: 'whitelisted role', roleId: 'trial' });
   assert.equal(result.kickable, false);
   assert.equal(assess(plain({}), cfg(), { now: DAY_MS, downtime: [] }).listed, null);
 });
@@ -217,8 +235,8 @@ test('role action: marked members are done until they are active again', () => {
   const switched = assess(plain({ marked: { at: now - DAY_MS } }), cfg({ activity: { m: now - 40 * DAY_MS } }), ctx);
   assert.equal(switched.action, 'kick', 'action changed to kick: marked members are due');
 
-  const whitelisted = cfg({ action: { type: 'role' }, whitelist: { roles: [], users: ['m'] } });
-  assert.equal(assess(plain({ marked: { at: now } }), whitelisted, ctx).action, 'protected');
+  const blacklisted = cfg({ action: { type: 'role' }, blacklist: { roles: [], users: ['m'] } });
+  assert.equal(assess(plain({ marked: { at: now } }), blacklisted, ctx).action, 'protected');
 });
 
 test('actionOf fills in defaults', () => {
@@ -233,8 +251,8 @@ test('warningMs is off at 0 and when it would not fit before the limit', () => {
   assert.equal(warningMs(cfg({ warnDays: 30 })), 0);
 });
 
-test('a whitelisted member stays protected even while muted', () => {
-  const c = cfg({ whitelist: { roles: [], users: ['m'] } });
+test('a blacklisted member stays protected even while muted', () => {
+  const c = cfg({ blacklist: { roles: [], users: ['m'] } });
   assert.equal(assess(plain({ pausedBy: 'timeout' }), c, { now: DAY_MS, downtime: [] }).action, 'protected');
 });
 
@@ -291,13 +309,13 @@ test('countsAsVoice: in a channel, not AFK, not deafened', () => {
   assert.equal(countsAsVoice('vc', false, null), true, 'server has no AFK channel');
 });
 
-test('quickLeaveBanMs: only leaving within the window, never whitelisted members, off at 0', () => {
-  const c = cfg({ quickLeave: { minutes: 10, banDays: 7 }, whitelist: { roles: [], users: ['friend'] } });
+test('quickLeaveBanMs: only leaving within the window, never blacklisted members, off at 0', () => {
+  const c = cfg({ quickLeave: { minutes: 10, banDays: 7 }, blacklist: { roles: [], users: ['friend'] } });
   const left = (ms, userId = 'u') => quickLeaveBanMs(c, { userId, joinedAt: 1000, leftAt: 1000 + ms });
   assert.equal(left(30_000), 7 * DAY_MS, '30 seconds');
   assert.equal(left(10 * 60_000), 7 * DAY_MS, 'exactly at the limit');
   assert.equal(left(10 * 60_000 + 1), 0, 'stayed longer');
-  assert.equal(left(1000, 'friend'), 0, 'whitelisted member');
+  assert.equal(left(1000, 'friend'), 0, 'blacklisted member');
   assert.equal(quickLeaveBanMs(c, { userId: 'u', joinedAt: null, leftAt: 5 }), 0, 'join time unknown');
   assert.equal(quickLeaveBanMs(cfg({ quickLeave: { minutes: 0, banDays: 7 } }), { userId: 'u', joinedAt: 0, leftAt: 1 }), 0, 'off');
   assert.equal(quickLeaveBanMs(cfg(), { userId: 'u', joinedAt: 0, leftAt: 1 }), 0, 'never configured');
