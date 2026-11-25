@@ -128,6 +128,7 @@ The bot needs **Ban Members**, **Moderate Members** and/or **Manage Roles** in t
 | `/autokick disable` | Turn it off (activity keeps being tracked) |
 | `/autokick status` | Settings, lists, and how many members are past the limit |
 | `/autokick preview` | Who would be kicked right now |
+| `/autokick leaderboard [count:]` | Members closest to being kicked, ranked by time left, with how much of the limit they've used (default top 10, up to 25) |
 | `/autokick check member:` | One member's last activity and status |
 | `/autokick days days:` | Change the limit (1–365 days, default 30) |
 | `/autokick action type: [ban-days:]` | What happens to inactive members: kick (default), give/take roles, temporary ban, or soft ban |

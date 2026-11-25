@@ -204,6 +204,50 @@ test('preview lists members past the limit', async () => {
   assert.ok(text.indexOf('<@b>') < text.indexOf('<@a>'), 'longest inactive first');
 });
 
+test('leaderboard ranks watched members by time left, closest first', async () => {
+  const now = Date.now();
+  const api = fakeApi({
+    cfg: { ...baseConfig(), enabled: true },
+    results: [
+      result('fresh', 'keep', { reason: 'active', inactiveMs: 2 * DAY_MS, remainingMs: 28 * DAY_MS }),
+      result('due', 'kick', { inactiveMs: 31 * DAY_MS }),
+      result('close', 'keep', { reason: 'active', inactiveMs: 27 * DAY_MS, remainingMs: 3 * DAY_MS }),
+      result('stuck', 'blocked', { inactiveMs: 45 * DAY_MS }),
+      result('muted', 'paused', { reason: 'timeout', inactiveMs: 20 * DAY_MS, remainingMs: 10 * DAY_MS }),
+      result('warned', 'keep', {
+        reason: 'notice',
+        inactiveMs: 33 * DAY_MS,
+        remainingMs: 1 * DAY_MS,
+        warning: { at: now - 6 * DAY_MS, kickAfter: now + DAY_MS, delivered: true },
+      }),
+      result('staff', 'protected', { reason: 'whitelisted role', roleId: 'S' }),
+      result('robot', 'skip', { reason: 'bot' }),
+    ],
+  });
+  const embed = (await runCommand(sub('leaderboard'), api)).embeds[0];
+  const order = [...embed.description.matchAll(/\*\*\d+\.\*\* <@(\w+)>/g)].map((m) => m[1]);
+  assert.deepEqual(order, ['stuck', 'due', 'warned', 'close', 'muted', 'fresh'], 'past the limit first, then by time left');
+  assert.equal(embed.title, 'Inactivity leaderboard (6 members)');
+  assert.match(embed.description, /<@due>.*▰{10} 100% · inactive 31 days · 🔴 due at the next check/);
+  assert.match(embed.description, /<@stuck>.*🟠 past the limit, but I can't kick them/);
+  assert.match(embed.description, /<@warned>.*🟡 warned, kicked <t:\d+:R>/);
+  assert.match(embed.description, /<@close>.*▰{9}▱ 90% .*🟡 kicked <t:\d+:R>/);
+  assert.match(embed.description, /<@muted>.*⏸️ clock paused \(timed out\), 10 days left/);
+  assert.match(embed.description, /<@fresh>.*▱{10} 6% .*🟢 kicked/);
+  assert.match(embed.footer.text, /Not ranked: 1 protected by the whitelist, bots and the server owner\./);
+
+  const top = (await runCommand(sub('leaderboard', [{ name: 'count', type: 4, value: 2 }]), api)).embeds[0];
+  assert.equal(top.title, 'Inactivity leaderboard (top 2 of 6)');
+  assert.doesNotMatch(top.description, /<@warned>/);
+
+  const off = await runCommand(sub('leaderboard'), fakeApi({ results: [result('due', 'kick')] }));
+  assert.match(off.embeds[0].description, /AutoKick is off/);
+  assert.match(off.embeds[0].description, /🔴 past the limit$/);
+
+  const empty = await runCommand(sub('leaderboard'), fakeApi({ results: [result('staff', 'protected')] }));
+  assert.match(empty.content, /Nobody is being watched.*1 protected by the whitelist/);
+});
+
 const pauseCmd = (name, role) => ({
   guild_id: 'G',
   member: { user: { id: 'admin' } },

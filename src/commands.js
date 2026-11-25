@@ -101,6 +101,14 @@ export const COMMANDS = [
       { type: SUB, name: 'preview', description: 'List members who would be kicked right now' },
       {
         type: SUB,
+        name: 'leaderboard',
+        description: 'Rank members by how close they are to being kicked',
+        options: [
+          { type: INTEGER, name: 'count', description: 'How many members to show (default 10, up to 25)', min_value: 1, max_value: 25 },
+        ],
+      },
+      {
+        type: SUB,
         name: 'check',
         description: "Show one member's last activity",
         options: [{ type: USER, name: 'member', description: 'Member to check', required: true }],
@@ -454,6 +462,67 @@ function firstKickAt(cfg, api) {
   return Math.max(cfg.armedAt ?? 0, api.nextSweepAt());
 }
 
+/** Join lines for an embed description, cutting off with "…and N more." before Discord's limit. */
+function fitLines(parts, max = 3900) {
+  let text = '';
+  for (const [i, part] of parts.entries()) {
+    if (text.length + part.length > max) return `${text}\n…and ${parts.length - i} more.`;
+    text += (text ? '\n' : '') + part;
+  }
+  return text;
+}
+
+// ---------------------------------------------------------------- leaderboard
+
+/** Everyone the inactivity rules still apply to (not bots, the owner, whitelisted or already marked). */
+const RANKED_ACTIONS = new Set(['kick', 'blocked', 'keep', 'paused']);
+const SOON_MS = 7 * DAY_MS;
+
+/**
+ * Members closest to the inactivity action first. Time left includes any
+ * warning notice; anyone already past it counts as 0. Ties: longest inactive first.
+ */
+function rankByTimeLeft(results) {
+  return results
+    .filter((r) => RANKED_ACTIONS.has(r.result.action))
+    .map((entry) => ({
+      ...entry,
+      leftMs: ['kick', 'blocked'].includes(entry.result.action) ? 0 : (entry.result.remainingMs ?? 0),
+    }))
+    .sort((a, b) => a.leftMs - b.leftMs || b.result.inactiveMs - a.result.inactiveMs);
+}
+
+/** "▰▰▰▱▱▱▱▱▱▱ 30%": how much of the limit a member has used up. */
+function progressBar(fraction) {
+  const pct = Math.max(0, Math.min(100, Math.floor(fraction * 100)));
+  const filled = Math.floor(pct / 10);
+  return `${'▰'.repeat(filled)}${'▱'.repeat(10 - filled)} ${pct}%`;
+}
+
+function leaderboardLine({ member, result, leftMs }, cfg, w, api, now) {
+  const who = `<@${member.id}> (${escapeMarkdown(member.username)})`;
+  const bar = progressBar(result.inactiveMs / (cfg.days * DAY_MS));
+  let status;
+  switch (result.action) {
+    case 'kick':
+      status = cfg.enabled ? `🔴 due at the next check (${ts(firstKickAt(cfg, api))})` : '🔴 past the limit';
+      break;
+    case 'blocked':
+      status = `🟠 past the limit, but I can't ${w.can}`;
+      break;
+    case 'paused':
+      status = `⏸️ clock paused (${result.reason === 'timeout' ? 'timed out' : 'pause role'}), ${formatDuration(leftMs)} left`;
+      break;
+    default: {
+      const at = `${w.done} ${ts(now + leftMs)}`;
+      if (result.warning) status = `🟡 warned, ${at}`;
+      else if (result.warnNow) status = `🟡 warning DM due, ${at}`;
+      else status = `${leftMs <= SOON_MS ? '🟡' : '🟢'} ${at}`;
+    }
+  }
+  return `${who} ${bar} · inactive ${formatDuration(result.inactiveMs)} · ${status}`;
+}
+
 // ---------------------------------------------------------------- handlers
 
 const handlers = {
@@ -620,15 +689,43 @@ const handlers = {
       parts.push(...blocked.map(line));
     }
 
-    let description = '';
-    for (const [i, part] of parts.entries()) {
-      if (description.length + part.length > 3900) {
-        description += `\n…and ${parts.length - i} more.`;
-        break;
-      }
-      description += (description ? '\n' : '') + part;
-    }
+    const description = fitLines(parts);
     return { embeds: [{ title: `Inactive for ${plural(cfg.days, 'day')}+`, color: COLOR, description }] };
+  },
+
+  async leaderboard({ api, opts }) {
+    const { cfg, results } = await api.assessGuild();
+    const w = actionWords(cfg);
+    const ranked = rankByTimeLeft(results);
+    const protectedCount = results.filter((r) => r.result.action === 'protected').length;
+    const marked = results.filter((r) => r.result.action === 'done').length;
+    const notes = [];
+    if (protectedCount) notes.push(`${protectedCount} protected by the whitelist`);
+    if (marked) notes.push(`${marked} already marked inactive`);
+    notes.push('bots and the server owner');
+    const notRanked = `Not ranked: ${notes.join(', ')}.`;
+
+    if (!ranked.length) return { content: `Nobody is being watched for inactivity right now. ${notRanked}` };
+    const shown = ranked.slice(0, opts.count ?? 10);
+    const now = Date.now();
+    const intro = [
+      `Closest to being ${w.done} first. Limit: **${plural(cfg.days, 'day')}** without activity.`,
+      cfg.enabled ? '' : `AutoKick is off, so nobody is ${w.done} until \`/autokick enable\`.`,
+    ].filter(Boolean);
+    const lines = shown.map((entry, i) => `**${i + 1}.** ${leaderboardLine(entry, cfg, w, api, now)}`);
+    return {
+      embeds: [
+        {
+          title:
+            shown.length < ranked.length
+              ? `Inactivity leaderboard (top ${shown.length} of ${ranked.length})`
+              : `Inactivity leaderboard (${plural(ranked.length, 'member')})`,
+          color: COLOR,
+          description: fitLines([...intro, '', ...lines]),
+          footer: { text: `${notRanked} Use /autokick check for one member's details.` },
+        },
+      ],
+    };
   },
 
   async check({ api, opts }) {
