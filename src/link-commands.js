@@ -148,9 +148,8 @@ async function permissionWarnings(api, settings) {
   );
 }
 
-async function create({ api, userId }) {
+async function create({ api }) {
   const { code, expiresAt } = api.linkCreate();
-  await api.log(`🔗 <@${userId}> made a link code (expires ${ts(expiresAt)}).`).catch(() => {});
   return {
     content:
       `🔗 Link code: **\`${code}\`** (works once, expires ${ts(expiresAt)}).\n` +
@@ -159,8 +158,8 @@ async function create({ api, userId }) {
   };
 }
 
-async function join({ api, opts, userId }) {
-  const result = await api.linkJoin(opts.code, userId);
+async function join({ api, opts }) {
+  const result = await api.linkJoin(opts.code);
   switch (result.error) {
     case 'invalid':
       return { content: "❌ That code isn't valid or has expired. Ask for a new one (`/link create` in the other server)." };
@@ -226,8 +225,8 @@ function list({ api }) {
   };
 }
 
-async function remove({ api, opts, userId }) {
-  const match = await api.linkRemove(opts.server, userId);
+async function remove({ api, opts }) {
+  const match = await api.linkRemove(opts.server);
   if (!match) return { content: "❌ This server isn't linked to a server with that name or ID. Check `/link list`." };
   return {
     content:
@@ -236,7 +235,7 @@ async function remove({ api, opts, userId }) {
   };
 }
 
-async function share({ api, opts, userId }) {
+async function share({ api, opts }) {
   const cfg = api.getConfig();
   const settings = linkSettings(cfg);
   const { kind, mode } = opts;
@@ -268,10 +267,8 @@ async function share({ api, opts, userId }) {
       mode === 'default'
         ? `✅ ${KIND_LABEL[kind]} with **${name}** follow this server's main setting again: it ${MODE_TEXT[effective(only.id)]}.`
         : `✅ ${KIND_LABEL[kind]} with **${name}** only: this server ${MODE_TEXT[mode]}.`;
-    await api.log(`⚙️ <@${userId}> set ${kind} with **${name}** to **${mode === 'default' ? 'Default' : MODE_LABEL[mode]}**.`).catch(() => {});
   } else {
     header = `✅ ${KIND_LABEL[kind]}: by default this server ${MODE_TEXT[mode]}.`;
-    await api.log(`⚙️ <@${userId}> set linked-server ${kind} to **${MODE_LABEL[mode]}**.`).catch(() => {});
   }
   const lines = [header];
   if (!only) {
@@ -308,7 +305,7 @@ async function share({ api, opts, userId }) {
   return { content: lines.join('\n') };
 }
 
-async function roles({ api, opts, interaction, userId }, sub) {
+async function roles({ api, opts, interaction }, sub) {
   const cfg = api.getConfig();
   const settings = linkSettings(cfg);
 
@@ -343,7 +340,6 @@ async function roles({ api, opts, interaction, userId }, sub) {
     if (!settings.sharedRoles.includes(id)) return { content: `${mention} isn't shared.` };
     settings.sharedRoles = settings.sharedRoles.filter((r) => r !== id);
     saveLink(api, cfg, settings);
-    await api.log(`⚙️ <@${userId}> stopped sharing ${mention} with linked servers.`).catch(() => {});
     return { content: `✅ ${mention} is no longer shared. Nobody gains or loses it because of linked servers anymore.` };
   }
 
@@ -354,7 +350,6 @@ async function roles({ api, opts, interaction, userId }, sub) {
   settings.sharedRoles = [...settings.sharedRoles, id];
   saveLink(api, cfg, settings);
   await api.linkSeedRole(id).catch(() => {}); // note who has it now, so removals later are noticed
-  await api.log(`⚙️ <@${userId}> started sharing ${mention} with linked servers.`).catch(() => {});
 
   const lines = [`✅ ${mention} is shared. It syncs with a shared role named **${escapeMarkdown(name ?? 'the same')}** in linked servers.`];
   const match = (await api.linkRoleMatches().catch(() => null))?.find((m) => m.roleId === id);
@@ -366,7 +361,7 @@ async function roles({ api, opts, interaction, userId }, sub) {
   return { content: lines.join('\n') };
 }
 
-async function exempt({ api, opts, interaction, userId }, sub) {
+async function exempt({ api, opts, interaction }, sub) {
   const cfg = api.getConfig();
   const settings = linkSettings(cfg);
   if (sub === 'list') {
@@ -387,7 +382,6 @@ async function exempt({ api, opts, interaction, userId }, sub) {
     if (!count) return { content: 'The exempt list is already empty.' };
     settings.exempt = { roles: [], users: [] };
     saveLink(api, cfg, settings);
-    await api.log(`⚙️ <@${userId}> cleared the linked-server exempt list.`).catch(() => {});
     return { content: `✅ Cleared the exempt list (${count} ${count === 1 ? 'entry' : 'entries'}).` };
   }
 
@@ -400,7 +394,6 @@ async function exempt({ api, opts, interaction, userId }, sub) {
     if (entries.includes(target.id)) return { content: `${target.mention} is already exempt.` };
     settings.exempt[kind] = [...entries, target.id];
     saveLink(api, cfg, settings);
-    await api.log(`⚙️ <@${userId}> exempted ${target.mention} from linked servers.`).catch(() => {});
     return {
       content:
         `✅ ${target.mention} ${target.isRole ? '(everyone with it) ' : ''}won't be banned, timed out or have roles changed ` +
@@ -410,7 +403,6 @@ async function exempt({ api, opts, interaction, userId }, sub) {
   if (!entries.includes(target.id)) return { content: `${target.mention} isn't exempt.` };
   settings.exempt[kind] = entries.filter((x) => x !== target.id);
   saveLink(api, cfg, settings);
-  await api.log(`⚙️ <@${userId}> removed ${target.mention} from the linked-server exempt list.`).catch(() => {});
   return { content: `✅ ${target.mention} is no longer exempt.` };
 }
 

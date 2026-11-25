@@ -10,7 +10,6 @@
 
 import { BudgetExceeded, memberRecord } from './discord.js';
 import {
-  escapeMarkdown,
   LINK_KINDS,
   linkExempt,
   linkMode,
@@ -29,26 +28,6 @@ const MARK_MS = 5 * 60_000;
 const JOB_MAX_AGE_MS = 24 * 60 * 60_000;
 const MAX_TIMEOUT_MS = 28 * 24 * 60 * 60_000; // Discord's limit
 const UNDO_JOBS = new Set(['unban', 'untimeout']);
-const JOB_WHAT = {
-  ban: 'ban',
-  unban: 'unban',
-  timeout: 'timeout',
-  untimeout: 'timeout removal',
-  role_add: 'role',
-  role_remove: 'role removal',
-  role_pull: 'role',
-};
-const JOB_PERMISSION = {
-  ban: 'Ban Members',
-  unban: 'Ban Members',
-  timeout: 'Moderate Members',
-  untimeout: 'Moderate Members',
-  role_add: 'Manage Roles',
-  role_remove: 'Manage Roles',
-  role_pull: 'Manage Roles',
-};
-
-const unix = (ms, style = 'R') => `<t:${Math.floor(ms / 1000)}:${style}>`;
 
 export const linkMethods = {
   initLinks() {
@@ -317,16 +296,6 @@ export const linkMethods = {
         }
         done();
         console.warn(`Link job ${job.kind} for ${job.user_id} in ${job.target_guild} failed: ${err.message}`);
-        const why =
-          err.status === 403
-            ? `I need **${JOB_PERMISSION[job.kind]}**, and my role has to be above theirs.`
-            : err.message;
-        await this.logSafely(
-          job.target_guild,
-          `⚠️ Couldn't apply a ${JOB_WHAT[job.kind]} from **${escapeMarkdown(this.guildName(job.source_guild))}** ` +
-            `to <@${job.user_id}>: ${why}`,
-          budget,
-        );
       }
     }
   },
@@ -335,8 +304,6 @@ export const linkMethods = {
     const { source_guild: source, target_guild: target, user_id: userId } = job;
     const tcfg = this.getConfig(target);
     if (!tcfg) return;
-    const sourceName = escapeMarkdown(this.guildName(source));
-    const who = `<@${userId}>${data.username ? ` (**${escapeMarkdown(data.username)}**)` : ''}`;
 
     switch (job.kind) {
       case 'ban': {
@@ -371,13 +338,6 @@ export const linkMethods = {
           this.sql.exec('DELETE FROM linked_bans WHERE guild_id = ? AND user_id = ?', target, userId);
           throw err;
         }
-        await this.logSafely(
-          target,
-          `🔗 Banned ${who}: they were banned in **${sourceName}**` +
-            (sourceBan.reason ? ` (${escapeMarkdown(sourceBan.reason).slice(0, 300)})` : '') +
-            '.',
-          budget,
-        );
         return;
       }
 
@@ -394,7 +354,6 @@ export const linkMethods = {
           reason: `${LINK_REASON} unbanned in ${this.guildName(source)}`,
           budget,
         });
-        await this.logSafely(target, `🔗 Unbanned ${who}: their ban in **${sourceName}** was lifted.`, budget);
         return;
       }
 
@@ -423,11 +382,6 @@ export const linkMethods = {
           this.sql.exec('DELETE FROM linked_timeouts WHERE guild_id = ? AND user_id = ?', target, userId);
           throw err;
         }
-        await this.logSafely(
-          target,
-          `🔗 Timed out ${who} until ${unix(until, 'f')}: they were timed out in **${sourceName}**.`,
-          budget,
-        );
         return;
       }
 
@@ -445,7 +399,6 @@ export const linkMethods = {
           reason: `${LINK_REASON} timeout lifted in ${this.guildName(source)}`,
           budget,
         });
-        await this.logSafely(target, `🔗 Lifted ${who}'s timeout: it was lifted in **${sourceName}**.`, budget);
         return;
       }
 
@@ -507,7 +460,7 @@ export const linkMethods = {
     return { code, expiresAt };
   },
 
-  async joinLink(guildId, input, userId, budget) {
+  joinLink(guildId, input) {
     const code = normalizeLinkCode(input);
     const row = this.sql.exec('SELECT guild_id, expires_at FROM link_codes WHERE code = ?', code).toArray()[0];
     if (!row || row.expires_at < Date.now()) return { error: 'invalid' };
@@ -522,13 +475,6 @@ export const linkMethods = {
     const [a, b] = [guildId, other].sort();
     this.sql.exec('INSERT INTO links (guild_a, guild_b, created_at) VALUES (?, ?, ?)', a, b, Date.now());
     this.sql.exec('DELETE FROM link_codes WHERE code = ?', code);
-    const here = escapeMarkdown(this.guildName(guildId));
-    await this.logSafely(
-      other,
-      `🔗 Linked with **${here}** (they used this server's code). Nothing is shared until you choose with \`/link share\`.`,
-      budget,
-    ).catch(() => {});
-    await this.logSafely(guildId, `🔗 Linked with **${escapeMarkdown(name)}** by <@${userId}>.`, budget).catch(() => {});
     return { id: other, name };
   },
 
@@ -544,7 +490,7 @@ export const linkMethods = {
     });
   },
 
-  async unlink(guildId, query, userId, budget) {
+  unlink(guildId, query) {
     const q = String(query ?? '').trim();
     const match = this.linkList(guildId).find((l) => l.id === q || l.name.toLowerCase() === q.toLowerCase());
     if (!match) return null;
@@ -560,10 +506,6 @@ export const linkMethods = {
       match.id,
       guildId,
     );
-    await this.logSafely(match.id, `🔗 **${escapeMarkdown(this.guildName(guildId))}** unlinked from this server.`, budget).catch(
-      () => {},
-    );
-    await this.logSafely(guildId, `🔗 Unlinked from **${escapeMarkdown(match.name)}** by <@${userId}>.`, budget).catch(() => {});
     return match;
   },
 

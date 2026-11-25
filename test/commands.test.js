@@ -146,7 +146,7 @@ test('enable turns it on with a grace period and reports who is due', async () =
   assert.ok(api.state.cfg.armedAt > Date.now() + 59 * 60_000);
   assert.match(reply.content, /1 member\*\* is past the limit/);
   assert.match(reply.content, /1 inactive member can't be kicked/);
-  assert.equal(api.state.logs.length, 1);
+  assert.deepEqual(api.state.logs, [], 'setting changes are not posted in the log channel');
 });
 
 test('disable turns it off', async () => {
@@ -175,6 +175,10 @@ test('whitelist add moves an entry off the blacklist; @everyone is refused', asy
   const everyone = await runCommand(listCmd('blacklist', 'add', 'G', { roles: { G: { id: 'G' } } }), api);
   assert.match(everyone.content, /@everyone can't/);
   assert.deepEqual(api.state.cfg.blacklist.roles, ['R2']);
+
+  await runCommand(listCmd('whitelist', 'remove', 'R1', { roles: { R1: { id: 'R1' } } }), api);
+  await runCommand(listCmd('blacklist', 'reset'), api);
+  assert.deepEqual(api.state.logs, [], 'list changes are never posted in the log channel');
 });
 
 test('blacklist add/remove for a member', async () => {
@@ -458,7 +462,7 @@ test('warn sets, refuses and turns off the warning DM', async () => {
 
   assert.match(await warn(7), /DM \*\*7 days\*\* before they're kicked/);
   assert.equal(api.state.cfg.warnDays, 7);
-  assert.match(api.state.logs.at(-1), /Warning DMs set to 7 days/);
+  assert.deepEqual(api.state.logs, [], 'not posted in the log channel');
   assert.match(await warn(7), /already set to 7 days/);
 
   assert.match(await warn(30), /must be less than the \*\*30 days\*\* limit/);
@@ -538,7 +542,7 @@ test('/quickleave sets the window and ban length, keeps the length when omitted,
   assert.deepEqual(api.state.cfg.quickLeave, { minutes: 10, banDays: 3 });
   assert.match(on, /leaves within \*\*10 minutes\*\* of joining gets banned for \*\*3 days\*\*/);
   assert.doesNotMatch(on, /⚠️/, 'has the permissions it needs');
-  assert.match(api.state.logs.at(-1), /Quick-leave bans set/);
+  assert.deepEqual(api.state.logs, [], 'not posted in the log channel');
 
   await quick([minutes(5)]);
   assert.deepEqual(api.state.cfg.quickLeave, { minutes: 5, banDays: 3 }, 'ban length kept');
@@ -599,7 +603,7 @@ test('action switches between kick, temp ban, soft ban and roles, with a grace p
   assert.match(temp, /will now be \*\*banned for 14 days\*\*/);
   assert.match(temp, /unbanned automatically/);
   assert.ok(api.state.cfg.armedAt > Date.now() + 59 * 60_000, 'grace period after switching');
-  assert.match(api.state.logs.at(-1), /Temporary ban \(14 days\)/);
+  assert.deepEqual(api.state.logs, [], 'not posted in the log channel');
 
   assert.match((await runCommand(actionCmd('tempban', 14), api)).content, /already \*\*Temporary ban/);
   assert.match((await runCommand(actionCmd('softban'), api)).content, /soft-banned.*messages from the last 7 days/s);
@@ -818,7 +822,7 @@ test('link create and join', async () => {
   const created = (await runCommand(linkCmd('create'), api)).content;
   assert.match(created, /Link code: \*\*`ABCD-EFGH`\*\*/);
   assert.match(created, /\/link join code:ABCD-EFGH/);
-  assert.doesNotMatch(api.state.logs.at(-1), /ABCD/, 'the code itself is not posted in the log');
+  assert.deepEqual(api.state.logs, [], 'nothing about links is posted in the log channel');
 
   assert.match((await runCommand(linkCmd('join', [opt('code', 'GOOD-CODE')]), api)).content, /Linked with \*\*Other server\*\*.*Nothing is shared yet/s);
   assert.match((await runCommand(linkCmd('join', [opt('code', 'MINE-HERE')]), api)).content, /made in this server/);

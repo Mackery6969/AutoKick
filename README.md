@@ -27,7 +27,7 @@ Choose with `/autokick action type:`. Kicking is the default.
 
 With the role action, make sure inactive members can still send a message or join voice somewhere (a "welcome back" channel, say). Otherwise they can't become active again to get their roles back.
 
-Members get a DM explaining what happened (if their DMs are open), and everything is posted in the log channel. Switching the action while AutoKick is on starts a new one-hour grace period.
+Members get a DM explaining what happened (if their DMs are open), and the action is posted in the log channel. Switching the action while AutoKick is on starts a new one-hour grace period.
 
 ## Who is never kicked
 
@@ -63,7 +63,7 @@ These are extras, separate from inactivity kicks. **Every one is off until you s
 - People kicked by a moderator or another bot (a verification bot, say) aren't banned, as long as the bot has **View Audit Log** so it can tell a kick from a leave.
 - The bot needs **Ban Members**. `/quickleave` warns if either permission is missing.
 - Bans show up in Server Settings → Bans with the date they end. Unban someone there to let them back early. If a moderator replaces the ban with their own, the bot leaves it in place.
-- Bans and unbans are posted in the log channel.
+- Quick-leave bans aren't posted in the log channel (it only gets inactivity kicks and warnings).
 
 ### Automatic slow mode
 
@@ -114,7 +114,7 @@ What gets shared:
 - **Exempt list (the link whitelist):** `/link exempt add` takes roles, members or user IDs. Linked servers never ban, time out or change the roles of exempt members here, and their bans and timeouts here aren't shared.
 - **One hop only:** if A is linked to B and B to C, A's bans reach B but not C. Link A and C directly if you want that.
 
-The bot needs **Ban Members**, **Moderate Members** and/or **Manage Roles** in the servers that receive, depending on what they accept. `/link share` warns if one is missing. Copies are posted in the receiving server's log channel. Either server can unlink at any time with `/link remove`.
+The bot needs **Ban Members**, **Moderate Members** and/or **Manage Roles** in the servers that receive, depending on what they accept. `/link share` warns if one is missing. Copies aren't posted in the log channel; the ban or timeout reason says which server it came from. Either server can unlink at any time with `/link remove`.
 
 ## Commands
 
@@ -134,7 +134,7 @@ The bot needs **Ban Members**, **Moderate Members** and/or **Manage Roles** in t
 | `/autokick action type: [ban-days:]` | What happens to inactive members: kick (default), give/take roles, temporary ban, or soft ban |
 | `/autokick inactive-roles give/take/unset/list/reset` | Roles given to or taken from inactive members (for the give/take roles action) |
 | `/autokick warn days:` | DM members this many days before they're kicked (0 = off, the default) |
-| `/autokick logchannel [channel:]` | Post kicks, warnings, bans and setting changes in a channel, for every feature (leave empty to turn off) |
+| `/autokick logchannel [channel:]` | Post inactivity kicks (or whichever action is set) and warning DMs in a channel. Nothing else is posted: no setting or list changes, no quick-leave or linked-server bans (leave empty to turn off) |
 | `/autokick blacklist add/remove/list/reset` | Roles or members that are never kicked. `add`/`remove` take a role or member, or a `user-id` for someone not in the server |
 | `/autokick whitelist add/remove/list/reset` | Roles or members that can be kicked even if they have a blacklisted role (same options as the blacklist) |
 | `/autokick channel-whitelist add/remove/list/reset` | If set, only activity in these channels/categories counts |

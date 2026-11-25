@@ -106,8 +106,6 @@ export const slowmodeMethods = {
         return false;
       }
       console.warn(`Could not set slow mode in ${channelId}: ${err.message}`);
-      const why = err.status === 403 ? 'I need the **Manage Channels** permission there.' : err.message;
-      await this.logSafely(guildId, `⚠️ Couldn't change slow mode in <#${channelId}>: ${why} I'll try again in an hour.`, budget);
       return false;
     }
   },

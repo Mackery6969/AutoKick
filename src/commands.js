@@ -532,14 +532,13 @@ function leaderboardLine({ member, result, leftMs }, cfg, w, api, now) {
 // ---------------------------------------------------------------- handlers
 
 const handlers = {
-  async enable({ api, userId }) {
+  async enable({ api }) {
     const cfg = api.getConfig();
     const wasOn = cfg.enabled;
     if (!wasOn) {
       cfg.enabled = true;
       cfg.armedAt = Date.now() + api.enableGraceMs;
       api.saveConfig(cfg);
-      await api.log(`▶️ AutoKick turned on by <@${userId}>.`).catch(() => {});
     }
     const assessed = await api.assessGuild();
     const { results } = assessed;
@@ -580,13 +579,12 @@ const handlers = {
     return { content: lines.join('\n') };
   },
 
-  async disable({ api, userId }) {
+  async disable({ api }) {
     const cfg = api.getConfig();
     if (!cfg.enabled) return { content: 'AutoKick is already **off**.' };
     cfg.enabled = false;
     cfg.armedAt = null;
     api.saveConfig(cfg);
-    await api.log(`⏸️ AutoKick turned off by <@${userId}>.`).catch(() => {});
     return {
       content: "⏸️ **AutoKick is off.** I'll keep tracking activity, so turning it back on picks up where it left off.",
     };
@@ -811,7 +809,7 @@ const handlers = {
     return { content: lines.join('\n') };
   },
 
-  async days({ api, opts, userId }) {
+  async days({ api, opts }) {
     const cfg = api.getConfig();
     const previous = cfg.days;
     cfg.days = opts.days;
@@ -822,12 +820,6 @@ const handlers = {
     const droppedWarn = cfg.warnDays && cfg.warnDays >= cfg.days ? cfg.warnDays : 0;
     if (droppedWarn) cfg.warnDays = 0;
     api.saveConfig(cfg);
-    await api
-      .log(
-        `⚙️ Inactivity limit changed from ${previous} to ${cfg.days} days by <@${userId}>.` +
-          (droppedWarn ? ' Warning DMs turned off (they no longer fit before the limit).' : ''),
-      )
-      .catch(() => {});
 
     const { due, waiting } = tally((await api.assessGuild()).results);
     const past = due.length + waiting.length;
@@ -848,7 +840,7 @@ const handlers = {
     return { content: lines.join('\n') };
   },
 
-  async warn({ api, opts, userId }) {
+  async warn({ api, opts }) {
     const cfg = api.getConfig();
     const days = opts.days;
     const previous = cfg.warnDays ?? 0;
@@ -864,13 +856,6 @@ const handlers = {
     }
     cfg.warnDays = days;
     api.saveConfig(cfg);
-    await api
-      .log(
-        days
-          ? `⚙️ Warning DMs set to ${plural(days, 'day')} before a kick by <@${userId}>.`
-          : `⚙️ Warning DMs turned off by <@${userId}>.`,
-      )
-      .catch(() => {});
 
     const w = actionWords(cfg);
     if (!days) {
@@ -890,7 +875,7 @@ const handlers = {
     return { content: lines.join('\n') };
   },
 
-  async action({ api, opts, userId }) {
+  async action({ api, opts }) {
     const cfg = api.getConfig();
     const previous = actionOf(cfg);
     const type = opts.type;
@@ -905,7 +890,6 @@ const handlers = {
     if (cfg.enabled && changedType) cfg.armedAt = Math.max(cfg.armedAt ?? 0, Date.now() + api.enableGraceMs);
     api.saveConfig(cfg);
     const w = actionWords(cfg);
-    await api.log(`⚙️ Inactivity action changed to **${w.label}** by <@${userId}>.`).catch(() => {});
 
     const lines = [`✅ Inactive members will now be **${w.full}** after ${plural(cfg.days, 'day')} without activity.`];
     if (type === 'tempban') lines.push("They're unbanned automatically when it ends, and can rejoin with an invite.");
@@ -952,7 +936,8 @@ const handlers = {
     cfg.logChannelId = opts.channel;
     api.saveConfig(cfg);
     try {
-      await api.log(`📋 AutoKick will post kicks, warnings and setting changes here (set by <@${userId}>).`);
+      // The one message outside kicks and warnings: it checks the bot can post here.
+      await api.log(`📋 AutoKick will post kicks and warning DMs here (set by <@${userId}>).`);
     } catch (err) {
       cfg.logChannelId = previous;
       api.saveConfig(cfg);
@@ -979,7 +964,7 @@ const LIST_EXPLAINERS = {
   },
 };
 
-async function editList({ api, opts, interaction, userId }, listName, action) {
+async function editList({ api, opts, interaction }, listName, action) {
   if (listName !== 'whitelist' && listName !== 'blacklist') return { content: 'Unknown command.' };
   const cfg = api.getConfig();
   if (action === 'list') {
@@ -998,7 +983,6 @@ async function editList({ api, opts, interaction, userId }, listName, action) {
       grace = ` Anyone who was protected can't be kicked before ${ts(cfg.armedAt)}.`;
     }
     api.saveConfig(cfg);
-    await api.log(`⚙️ <@${userId}> cleared the ${listName}.`).catch(() => {});
     return { content: `✅ Cleared the ${listName} (${count} ${count === 1 ? 'entry' : 'entries'}: ${cleared}).${grace}` };
   }
 
@@ -1019,7 +1003,6 @@ async function editList({ api, opts, interaction, userId }, listName, action) {
     const moved = cfg[other][kind].includes(id);
     cfg[other][kind] = cfg[other][kind].filter((x) => x !== id);
     api.saveConfig(cfg);
-    await api.log(`⚙️ <@${userId}> added ${mention} to the ${listName}.`).catch(() => {});
     return {
       content:
         `✅ Added ${mention} to the ${listName}${moved ? ` (and removed it from the ${other})` : ''}. ` +
@@ -1030,11 +1013,10 @@ async function editList({ api, opts, interaction, userId }, listName, action) {
   if (!list.includes(id)) return { content: `${mention} isn't on the ${listName}.` };
   cfg[listName][kind] = list.filter((x) => x !== id);
   api.saveConfig(cfg);
-  await api.log(`⚙️ <@${userId}> removed ${mention} from the ${listName}.`).catch(() => {});
   return { content: `✅ Removed ${mention} from the ${listName}.` };
 }
 
-async function editPauseRoles({ api, opts, interaction, userId }, action) {
+async function editPauseRoles({ api, opts, interaction }, action) {
   const cfg = api.getConfig();
   const detected = await api.detectedPauseRoles();
   if (action === 'list') {
@@ -1060,7 +1042,6 @@ async function editPauseRoles({ api, opts, interaction, userId }, action) {
     if (cfg.pauseRoles.includes(id)) return { content: `${mention} is already a pause role.` };
     cfg.pauseRoles.push(id);
     api.saveConfig(cfg);
-    await api.log(`⚙️ <@${userId}> added ${mention} as a pause role.`).catch(() => {});
     return {
       content: `✅ Members with ${mention} won't lose time while they have it, and can't be auto-kicked until it's removed.`,
     };
@@ -1075,7 +1056,6 @@ async function editPauseRoles({ api, opts, interaction, userId }, action) {
   }
   cfg.pauseRoles = cfg.pauseRoles.filter((x) => x !== id);
   api.saveConfig(cfg);
-  await api.log(`⚙️ <@${userId}> removed ${mention} as a pause role.`).catch(() => {});
   const still = detected.includes(id) ? ' It still counts automatically because of its name.' : '';
   return { content: `✅ ${mention} is no longer a pause role.${still}` };
 }
@@ -1094,7 +1074,7 @@ async function quickLeavePermissionWarning(api) {
  * /quickleave: temporarily ban people who leave right after joining.
  * No options shows the setting; minutes:0 turns it off; ban-days alone changes the ban length.
  */
-async function quickleave({ api, opts, userId }) {
+async function quickleave({ api, opts }) {
   const cfg = api.getConfig();
   const previous = quickLeaveOf(cfg);
   const banDays = opts['ban-days'] ?? previous.banDays;
@@ -1124,19 +1104,11 @@ async function quickleave({ api, opts, userId }) {
     if (!previous.minutes) return { content: 'Quick-leave bans are already **off**.' };
     cfg.quickLeave = { ...previous, minutes: 0, banDays };
     api.saveConfig(cfg);
-    await api.log(`⚙️ Quick-leave bans turned off by <@${userId}>.`).catch(() => {});
     return { content: '✅ Quick-leave bans are **off**. Bans already placed still end on their own date.' };
   }
 
   cfg.quickLeave = { minutes, banDays };
   api.saveConfig(cfg);
-  await api
-    .log(
-      `⚙️ Quick-leave bans set by <@${userId}>: leaving within ${plural(minutes, 'minute')} of joining ` +
-        `means a ${banDays}-day ban.`,
-    )
-    .catch(() => {});
-
   const lines = [
     `✅ Anyone who leaves within **${plural(minutes, 'minute')}** of joining gets banned for **${plural(banDays, 'day')}**, ` +
       'then unbanned automatically. This works whether or not inactivity kicks are on.',
@@ -1168,7 +1140,7 @@ const restoreSlowmode = (api, channelId, entry) =>
  * /slowmode: one whitelist. Channels on it get automatic slow mode;
  * messages from roles and users on it don't count toward how busy chat is.
  */
-async function editSlowmode({ api, opts, interaction, userId }, sub) {
+async function editSlowmode({ api, opts, interaction }, sub) {
   const cfg = api.getConfig();
   const settings = slowmodeSettings(cfg);
   const save = () => {
@@ -1207,7 +1179,6 @@ async function editSlowmode({ api, opts, interaction, userId }, sub) {
     for (const id of channelIds) if (await restoreSlowmode(api, id, settings.channels[id])) restored += 1;
     cfg.slowmode = { channels: {}, roles: [], users: [] };
     api.saveConfig(cfg);
-    await api.log(`⚙️ <@${userId}> cleared the slow mode whitelist.`).catch(() => {});
     const failed = channelIds.length - restored;
     return {
       content:
@@ -1239,7 +1210,6 @@ async function editSlowmode({ api, opts, interaction, userId }, sub) {
       if (listed) return { content: `${target.mention} is already on the slow mode whitelist.` };
       settings[kind] = [...settings[kind], target.id];
       save();
-      await api.log(`⚙️ <@${userId}> added ${target.mention} to the slow mode whitelist.`).catch(() => {});
       return {
         content:
           `✅ Messages from ${target.mention}${target.isRole ? ' (everyone with it)' : ''} no longer count toward how busy chat is, ` +
@@ -1249,7 +1219,6 @@ async function editSlowmode({ api, opts, interaction, userId }, sub) {
     if (!listed) return { content: `${target.mention} isn't on the slow mode whitelist.` };
     settings[kind] = settings[kind].filter((x) => x !== target.id);
     save();
-    await api.log(`⚙️ <@${userId}> removed ${target.mention} from the slow mode whitelist.`).catch(() => {});
     return { content: `✅ Messages from ${target.mention} count toward how busy chat is again.` };
   }
 
@@ -1258,7 +1227,6 @@ async function editSlowmode({ api, opts, interaction, userId }, sub) {
     if (!entry) return { content: `<#${channelId}> isn't on the slow mode whitelist.` };
     delete settings.channels[channelId];
     save();
-    await api.log(`⚙️ <@${userId}> turned off automatic slow mode in <#${channelId}>.`).catch(() => {});
     return {
       content:
         `✅ Automatic slow mode is off in <#${channelId}>. ` +
@@ -1281,13 +1249,6 @@ async function editSlowmode({ api, opts, interaction, userId }, sub) {
   const original = existing ? existing.original : await api.channelSlowmode(channelId).catch(() => 0);
   settings.channels[channelId] = { min, max, sensitivity, calm, original };
   save();
-  await api
-    .log(
-      `⚙️ <@${userId}> ${existing ? 'changed' : 'turned on'} automatic slow mode in <#${channelId}> ` +
-        `(${seconds(min)} to ${seconds(max)}, ${SENSITIVITY_LABEL[sensitivity]} sensitivity).`,
-    )
-    .catch(() => {});
-
   const lines = [
     `✅ ${existing ? 'Updated' : "I'll manage"} slow mode in <#${channelId}>: **${seconds(min)}** when it's quiet, ` +
       `up to **${seconds(max)}** when it's busy, **${SENSITIVITY_LABEL[sensitivity]}** sensitivity.`,
@@ -1303,7 +1264,7 @@ async function editSlowmode({ api, opts, interaction, userId }, sub) {
 }
 
 /** /autokick inactive-roles: which roles the role action gives and takes. */
-async function editInactiveRoles({ api, opts, interaction, userId }, sub) {
+async function editInactiveRoles({ api, opts, interaction }, sub) {
   const cfg = api.getConfig();
   const action = actionOf(cfg);
   const notRoleAction =
@@ -1330,7 +1291,6 @@ async function editInactiveRoles({ api, opts, interaction, userId }, sub) {
     if (!action.give.length && !action.take.length) return { content: 'No inactive roles are set.' };
     cfg.action = { ...action, give: [], take: [] };
     api.saveConfig(cfg);
-    await api.log(`⚙️ <@${userId}> cleared the inactive roles.`).catch(() => {});
     return { content: "✅ Cleared the inactive roles. Members already marked still get their roles back once they're active." };
   }
 
@@ -1342,7 +1302,6 @@ async function editInactiveRoles({ api, opts, interaction, userId }, sub) {
     if (!action.give.includes(id) && !action.take.includes(id)) return { content: `${mention} isn't given or taken.` };
     cfg.action = { ...action, give: action.give.filter((x) => x !== id), take: action.take.filter((x) => x !== id) };
     api.saveConfig(cfg);
-    await api.log(`⚙️ <@${userId}> stopped using ${mention} as an inactive role.`).catch(() => {});
     return { content: `✅ ${mention} is no longer given or taken. Members already marked still get their roles put back once they're active.` };
   }
 
@@ -1355,7 +1314,6 @@ async function editInactiveRoles({ api, opts, interaction, userId }, sub) {
   const moved = action[other].includes(id);
   cfg.action = { ...action, [list]: [...action[list], id], [other]: action[other].filter((x) => x !== id) };
   api.saveConfig(cfg);
-  await api.log(`⚙️ <@${userId}> set ${mention} to be ${list === 'give' ? 'given to' : 'taken from'} inactive members.`).catch(() => {});
 
   const lines = [
     list === 'give'
@@ -1371,7 +1329,7 @@ async function editInactiveRoles({ api, opts, interaction, userId }, sub) {
 
 const CHANNEL_LISTS = { 'channel-whitelist': 'whitelist', 'channel-blacklist': 'blacklist' };
 
-async function editChannelList({ api, opts, interaction, userId }, group, action) {
+async function editChannelList({ api, opts, interaction }, group, action) {
   const listName = CHANNEL_LISTS[group];
   const other = listName === 'whitelist' ? 'blacklist' : 'whitelist';
   const label = `channel ${listName}`;
@@ -1389,7 +1347,6 @@ async function editChannelList({ api, opts, interaction, userId }, group, action
     const count = list.length;
     cfg.channels[listName] = [];
     api.saveConfig(cfg);
-    await api.log(`⚙️ <@${userId}> cleared the ${label}.`).catch(() => {});
     const everywhere = cfg.channels.whitelist.length || cfg.channels.blacklist.length ? '' : ' Activity in every channel counts again.';
     return { content: `✅ Cleared the ${label} (${plural(count, 'channel')}).${everywhere}` };
   }
@@ -1406,7 +1363,6 @@ async function editChannelList({ api, opts, interaction, userId }, group, action
     const moved = cfg.channels[other].includes(id);
     cfg.channels[other] = cfg.channels[other].filter((x) => x !== id);
     api.saveConfig(cfg);
-    await api.log(`⚙️ <@${userId}> added <#${id}> to the ${label}.`).catch(() => {});
 
     const lines = [
       (listName === 'whitelist' ? `✅ Activity in ${where} counts.` : `✅ Activity in ${where} no longer counts.`) +
@@ -1425,7 +1381,6 @@ async function editChannelList({ api, opts, interaction, userId }, group, action
   if (!list.includes(id)) return { content: `${where} isn't on the ${label}.` };
   cfg.channels[listName] = list.filter((x) => x !== id);
   api.saveConfig(cfg);
-  await api.log(`⚙️ <@${userId}> removed <#${id}> from the ${label}.`).catch(() => {});
   const nowEmpty =
     listName === 'whitelist' && !cfg.channels.whitelist.length
       ? ' The channel whitelist is now empty, so activity counts everywhere except blacklisted channels.'
@@ -1473,7 +1428,7 @@ export async function runCommand(interaction, api) {
   if (interaction.data?.name === 'quickleave') {
     // No subcommands: the options sit directly on the command.
     const opts = Object.fromEntries((interaction.data.options ?? []).map((o) => [o.name, o.value]));
-    return quickleave({ api, interaction, userId: interaction.member?.user?.id, opts });
+    return quickleave({ api, interaction, opts });
   }
   const top = interaction.data?.options?.[0];
   if (!top) return { content: 'Unknown command.' };

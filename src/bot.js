@@ -1307,17 +1307,7 @@ export class AutoKickBot extends DurableObject {
         if (err.code !== 10007) failure = err; // 10007 = they've left the server: nothing to undo
       }
       forget();
-      const changes = [
-        removed.length ? `gave back ${removed.map((id) => `<@&${id}>`).join(', ')}` : '',
-        added.length ? `removed ${added.map((id) => `<@&${id}>`).join(', ')}` : '',
-      ].filter(Boolean);
-      if (!changes.length && !failure) continue;
-      await this.logSafely(
-        row.guild_id,
-        `🔄 <@${row.user_id}> is active again: ${changes.join('; ') || 'nothing to undo'}.` +
-          (failure ? ` ⚠️ Couldn't undo everything: ${failure.message}` : ''),
-        budget,
-      );
+      if (failure) console.warn(`Could not undo inactive roles for ${row.user_id} in ${row.guild_id}: ${failure.message}`);
     }
   }
 
@@ -1424,7 +1414,6 @@ export class AutoKickBot extends DurableObject {
     if (!banMs) return done(); // turned off, or blacklisted, since they left
 
     const stayed = formatShortDuration(row.left_at - row.joined_at);
-    const who = `<@${userId}> (**${escapeMarkdown(row.username ?? userId)}**)`;
     try {
       // Kicked by a moderator or another bot (a verification bot, say)? Then they didn't leave on their own.
       if (!kicks.has(guildId)) kicks.set(guildId, await this.recentKicks(guildId, budget));
@@ -1444,22 +1433,12 @@ export class AutoKickBot extends DurableObject {
       this.recordTempBan(guildId, userId, row.username, expiresAt, 'quickleave');
       done();
       console.log(`Quick-leave ban: ${userId} in ${guildId} (stayed ${stayed}).`);
-      await this.log(
-        guildId,
-        `🚪 Banned ${who} for ${formatDuration(banMs)}: they left ${stayed} after joining. ` +
-          `Unbanned automatically <t:${Math.floor(expiresAt / 1000)}:R>.`,
-        budget,
-      ).catch((err) => {
-        if (err instanceof BudgetExceeded) throw err;
-      });
     } catch (err) {
       if (err instanceof BudgetExceeded) throw err;
-      // Discord trouble: try again next minute (for up to an hour). Anything else: give up and say why.
+      // Discord trouble: try again next minute (for up to an hour). Anything else: give up.
       if ((err.status >= 500 || err.status === 429 || !err.status) && Date.now() - row.left_at < 60 * 60_000) return;
       done();
       console.warn(`Could not ban quick leaver ${userId} in ${guildId}: ${err.message}`);
-      const why = err.status === 403 ? 'I need the **Ban Members** permission.' : err.message;
-      await this.log(guildId, `⚠️ Couldn't ban ${who} (left ${stayed} after joining): ${why}`, budget).catch(() => {});
     }
   }
 
@@ -1494,22 +1473,15 @@ export class AutoKickBot extends DurableObject {
   async liftTempBan(row, budget) {
     const { guild_id: guildId, user_id: userId } = row;
     const forget = () => this.forgetTempBan(guildId, userId);
-    const who = `<@${userId}> (**${escapeMarkdown(row.username ?? userId)}**)`;
     const what = { quickleave: 'quick-leave ban', inactive: 'temporary ban for inactivity', softban: 'soft ban' }[row.kind] ?? 'ban';
     try {
       const ban = await this.findBan(guildId, userId, budget);
       if (!ban) return forget(); // someone already unbanned them
-      if (!ban.reason?.startsWith(BAN_REASON_PREFIX)) {
-        // A moderator replaced it with their own ban: that one stays.
-        forget();
-        await this.logSafely(guildId, `🔒 Left ${who} banned: their ${what} was replaced by another ban.`, budget);
-        return;
-      }
+      // A moderator replaced it with their own ban: that one stays.
+      if (!ban.reason?.startsWith(BAN_REASON_PREFIX)) return forget();
       this.markOwnBan(guildId, userId);
       await this.rest('DELETE', `/guilds/${guildId}/bans/${userId}`, { reason: `AutoKick: ${what} ended`, budget });
       forget();
-      // A soft ban was already logged when it happened; this only finished it.
-      if (row.kind !== 'softban') await this.logSafely(guildId, `🔓 Unbanned ${who}: their ${what} ended.`, budget);
     } catch (err) {
       if (err instanceof BudgetExceeded) throw err;
       // Lost Ban Members, or Discord trouble: try again in an hour.
@@ -1609,9 +1581,9 @@ export class AutoKickBot extends DurableObject {
       messageRate: (channelId) => this.messageRate(channelId),
       // Linked servers
       linkCreate: () => this.createLinkCode(guildId),
-      linkJoin: (code, userId) => this.joinLink(guildId, code, userId, budget),
+      linkJoin: (code) => this.joinLink(guildId, code),
       linkList: () => this.linkList(guildId),
-      linkRemove: (query, userId) => this.unlink(guildId, query, userId, budget),
+      linkRemove: (query) => this.unlink(guildId, query),
       linkRoleMatches: () => this.linkRoleMatches(guildId, budget),
       linkSeedRole: (roleId) => this.seedSharedRole(guildId, roleId, budget),
       quickLeaveBanCount: () =>

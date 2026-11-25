@@ -191,7 +191,7 @@ test('a ban is copied one hop (A-B and B-C links never carry it to C), and lifte
   await run();
   assert.equal(discord.bans.B.get('u1'), 'AutoKick link: banned in Server A: spam');
   assert.equal(discord.bans.C.has('u1'), false, 'not passed on from B to C');
-  assert.match(bot.logs.find(([g]) => g === 'B')[1], /🔗 Banned <@u1>.*banned in \*\*Server A\*\* \(spam\)/);
+  assert.deepEqual(bot.logs, [], 'linked-server bans are not posted in the log channel');
 
   moderator.unban('A', 'u1');
   await run();
